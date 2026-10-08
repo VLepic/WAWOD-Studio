@@ -4,6 +4,8 @@ export type GroundSurfaceKind = "Floor" | "Grass";
 export type SiteSurfaceKind = "Grass";
 export type RoofType = "Flat" | "Gable" | "Shed" | "Hip";
 export type WallTopMode = "FixedHeight" | "FollowRoof";
+export type WallStairFollowMode = "None" | "Top" | "Bottom";
+export type WallStairFollowProfile = "Stepped" | "Smooth";
 export type MeasurementUnit = "cm" | "dm" | "m";
 export type RoofVertexElevationMode = "Explicit" | "Computed";
 export type RoofEdgeRole = "Generic" | "LowerEave" | "UpperEave" | "Ridge" | "Hip" | "Valley";
@@ -11,6 +13,8 @@ export type RoofConstraintDirection = "AwayFromReference" | "TowardReference";
 export type RoofOpeningCutMode = "NormalToRoof" | "Vertical";
 export type RoofOpeningRotationDeg = 0 | 90;
 export type SolarPanelOrientation = "Portrait" | "Landscape";
+export type MaterialTargetKind = "Wall" | "Slab" | "RoofFace";
+export type MaterialSurface = "All" | "Left" | "Right";
 
 export interface Vec2 {
   x: number;
@@ -153,6 +157,10 @@ export interface Wall {
   levelId: string;
   wallTypeId: string;
   topMode: WallTopMode;
+  stairFollowMode: WallStairFollowMode;
+  stairFollowProfile: WallStairFollowProfile;
+  stairFollowOffsetM: number;
+  stairId: string | null;
   startNodeId: string;
   endNodeId: string;
 }
@@ -289,6 +297,25 @@ export interface Site {
   visible3D: boolean;
 }
 
+export interface MaterialDefinition {
+  id: string;
+  name: string;
+  colorHex: string;
+}
+
+export interface SurfaceMaterialAssignment {
+  materialId: string;
+  targetKind: MaterialTargetKind;
+  targetId: string;
+  surface: MaterialSurface;
+}
+
+export interface MaterialTarget {
+  kind: MaterialTargetKind;
+  id: string;
+  surface: MaterialSurface;
+}
+
 export interface Room {
   id: string;
   levelId: string;
@@ -320,6 +347,8 @@ export interface Project {
   projectName: string;
   settings: ProjectSettings;
   site: Site;
+  materials: MaterialDefinition[];
+  materialAssignments: SurfaceMaterialAssignment[];
   levels: Level[];
   wallTypes: WallType[];
   roofLayers: RoofLayer[];
@@ -459,6 +488,10 @@ export function createWall(overrides: Partial<Wall> = {}): Wall {
     levelId: overrides.levelId ?? "",
     wallTypeId: overrides.wallTypeId ?? "",
     topMode: overrides.topMode ?? "FixedHeight",
+    stairFollowMode: overrides.stairFollowMode ?? "None",
+    stairFollowProfile: overrides.stairFollowProfile ?? "Stepped",
+    stairFollowOffsetM: overrides.stairFollowOffsetM ?? 0,
+    stairId: overrides.stairId ?? null,
     startNodeId: overrides.startNodeId ?? "",
     endNodeId: overrides.endNodeId ?? "",
   };
@@ -560,6 +593,16 @@ export function createSite(overrides: Partial<Site> = {}): Site {
   };
 }
 
+export function createMaterialDefinition(
+  overrides: Partial<MaterialDefinition> = {},
+): MaterialDefinition {
+  return {
+    id: overrides.id ?? createId("material"),
+    name: overrides.name ?? "Warm White",
+    colorHex: overrides.colorHex ?? "#d8d3c8",
+  };
+}
+
 export function createRoom(overrides: Partial<Room> = {}): Room {
   return {
     id: overrides.id ?? createId("room"),
@@ -620,6 +663,8 @@ export function createEmptyProject(overrides: Partial<Project> = {}): Project {
     projectName: overrides.projectName ?? "WaWoD Studio",
     settings: overrides.settings ?? { ...DEFAULT_PROJECT_SETTINGS },
     site: overrides.site ?? createSite(),
+    materials: overrides.materials ?? [],
+    materialAssignments: overrides.materialAssignments ?? [],
     levels: overrides.levels ?? [],
     wallTypes: overrides.wallTypes ?? [],
     roofLayers: overrides.roofLayers ?? [],
@@ -677,6 +722,40 @@ export function ensureProjectDefaults(project: Project): Project {
       new Set(sketch.faces.map((face) => face.id)),
     ]),
   );
+  const materials = (project.materials ?? []).map((material) =>
+    createMaterialDefinition(material),
+  );
+  const materialIds = new Set(materials.map((material) => material.id));
+  const wallIds = new Set((project.walls ?? []).map((wall) => wall.id));
+  const slabIds = new Set((project.slabs ?? []).map((slab) => slab.id));
+  const roofFaceIds = new Set(roofSketches.flatMap((sketch) => sketch.faces.map((face) => face.id)));
+  const materialAssignments = (project.materialAssignments ?? [])
+    .flatMap((assignment): SurfaceMaterialAssignment[] => {
+      const surface = assignment.surface ?? "All";
+      if (assignment.targetKind === "Wall" && surface === "All") {
+        return [
+          { ...assignment, surface: "Left" },
+          { ...assignment, surface: "Right" },
+        ];
+      }
+
+      return [{ ...assignment, surface }];
+    })
+    .filter((assignment) => {
+      if (!materialIds.has(assignment.materialId)) {
+        return false;
+      }
+
+      if (assignment.targetKind === "Wall") {
+        return wallIds.has(assignment.targetId);
+      }
+
+      if (assignment.targetKind === "Slab") {
+        return slabIds.has(assignment.targetId);
+      }
+
+      return roofFaceIds.has(assignment.targetId);
+    });
 
   return {
     ...project,
@@ -684,8 +763,11 @@ export function ensureProjectDefaults(project: Project): Project {
       project.projectName.trim().length > 0 ? project.projectName : "WaWoD Studio",
     settings: { ...DEFAULT_PROJECT_SETTINGS, ...project.settings },
     site: createSite(project.site),
+    materials,
+    materialAssignments,
     levels,
     wallTypes,
+    walls: (project.walls ?? []).map((wall) => createWall(wall)),
     roofLayers,
     slabs: (project.slabs ?? []).map((slab) =>
       createSlab({

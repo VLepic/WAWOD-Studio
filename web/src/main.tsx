@@ -4,6 +4,7 @@ import App from "./App";
 import Preview3DWindowApp from "./Preview3DWindowApp";
 import { isPreviewWindowHash } from "./domain/preview-window-sync";
 import "./styles.css";
+import { FloatingWindowLayout } from "./components/floating-window";
 
 const rootComponent = isPreviewWindowHash(window.location.hash) ? (
   <Preview3DWindowApp />
@@ -13,6 +14,6 @@ const rootComponent = isPreviewWindowHash(window.location.hash) ? (
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    {rootComponent}
+    <FloatingWindowLayout>{rootComponent}</FloatingWindowLayout>
   </React.StrictMode>,
 );

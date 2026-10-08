@@ -9,6 +9,9 @@ import type {
   Level,
   Measurement,
   MeasurementUnit,
+  MaterialDefinition,
+  MaterialTargetKind,
+  MaterialSurface,
   NodeData,
   Pose2D,
   Project,
@@ -32,11 +35,14 @@ import type {
   ShapeKind,
   Site,
   SiteSurfaceKind,
+  SurfaceMaterialAssignment,
   Slab,
   SlabKind,
   Stair,
   Vec2,
   Wall,
+  WallStairFollowMode,
+  WallStairFollowProfile,
   WallTopMode,
   WallType,
   WindowOpening,
@@ -53,12 +59,16 @@ export const groundSurfaceKindSchema = z.enum(["Floor", "Grass"]) satisfies z.Zo
 export const siteSurfaceKindSchema = z.enum(["Grass"]) satisfies z.ZodType<SiteSurfaceKind>;
 export const roofTypeSchema = z.enum(["Flat", "Gable", "Shed", "Hip"]) satisfies z.ZodType<RoofType>;
 export const wallTopModeSchema = z.enum(["FixedHeight", "FollowRoof"]) satisfies z.ZodType<WallTopMode>;
+export const wallStairFollowModeSchema = z.enum(["None", "Top", "Bottom"]) satisfies z.ZodType<WallStairFollowMode>;
+export const wallStairFollowProfileSchema = z.enum(["Stepped", "Smooth"]) satisfies z.ZodType<WallStairFollowProfile>;
 export const measurementUnitSchema = z.enum(["cm", "dm", "m"]) satisfies z.ZodType<MeasurementUnit>;
 export const roofVertexElevationModeSchema = z.enum(["Explicit", "Computed"]) satisfies z.ZodType<RoofVertexElevationMode>;
 export const roofEdgeRoleSchema = z.enum(["Generic", "LowerEave", "UpperEave", "Ridge", "Hip", "Valley"]) satisfies z.ZodType<RoofEdgeRole>;
 export const roofOpeningCutModeSchema = z.enum(["NormalToRoof", "Vertical"]) satisfies z.ZodType<RoofOpeningCutMode>;
 export const roofOpeningRotationDegSchema = z.union([z.literal(0), z.literal(90)]) satisfies z.ZodType<RoofOpeningRotationDeg>;
 export const solarPanelOrientationSchema = z.enum(["Portrait", "Landscape"]) satisfies z.ZodType<SolarPanelOrientation>;
+export const materialTargetKindSchema = z.enum(["Wall", "Slab", "RoofFace"]) satisfies z.ZodType<MaterialTargetKind>;
+export const materialSurfaceSchema = z.enum(["All", "Left", "Right"]) satisfies z.ZodType<MaterialSurface>;
 export const doorDesign3DKindSchema = z.enum(["Normal", "Garage", "Glass", "HSPortal"]);
 export const door3DOpenStateSchema = z.enum(["Closed", "Open"]);
 export const door3DHingeSideSchema = z.enum(["Left", "Right"]);
@@ -234,6 +244,10 @@ export const wallSchema = z.object({
   levelId: nonEmptyStringSchema,
   wallTypeId: nonEmptyStringSchema,
   topMode: wallTopModeSchema,
+  stairFollowMode: wallStairFollowModeSchema,
+  stairFollowProfile: wallStairFollowProfileSchema,
+  stairFollowOffsetM: finiteNumberSchema,
+  stairId: nonEmptyStringSchema.nullable(),
   startNodeId: nonEmptyStringSchema,
   endNodeId: nonEmptyStringSchema,
 }) satisfies z.ZodType<Wall>;
@@ -343,6 +357,19 @@ export const siteSchema = z.object({
   visible3D: z.boolean(),
 }) satisfies z.ZodType<Site>;
 
+export const materialDefinitionSchema = z.object({
+  id: nonEmptyStringSchema,
+  name: nonEmptyStringSchema,
+  colorHex: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+}) satisfies z.ZodType<MaterialDefinition>;
+
+export const surfaceMaterialAssignmentSchema = z.object({
+  materialId: nonEmptyStringSchema,
+  targetKind: materialTargetKindSchema,
+  targetId: nonEmptyStringSchema,
+  surface: materialSurfaceSchema,
+}) satisfies z.ZodType<SurfaceMaterialAssignment>;
+
 export const roomSchema = z.object({
   id: nonEmptyStringSchema,
   levelId: nonEmptyStringSchema,
@@ -374,6 +401,8 @@ export const projectSchema = z.object({
   projectName: nonEmptyStringSchema,
   settings: projectSettingsSchema,
   site: siteSchema,
+  materials: z.array(materialDefinitionSchema),
+  materialAssignments: z.array(surfaceMaterialAssignmentSchema),
   levels: z.array(levelSchema).min(1),
   wallTypes: z.array(wallTypeSchema).min(1),
   roofLayers: z.array(roofLayerSchema).min(1),

@@ -21,6 +21,10 @@ export interface RenderWallRun {
   levelId: string;
   wallTypeId: string;
   topMode: Project["walls"][number]["topMode"];
+  stairFollowMode: Project["walls"][number]["stairFollowMode"];
+  stairFollowProfile: Project["walls"][number]["stairFollowProfile"];
+  stairFollowOffsetM: number;
+  stairId: string | null;
   startNodeId: string;
   endNodeId: string;
   start: Vec2;
@@ -152,7 +156,7 @@ function buildWallRenderInfo(
         endNode.position.y - startNode.position.y,
       ),
       direction,
-      mergeKey: `${wall.levelId}|${wall.wallTypeId}|${wall.topMode}`,
+      mergeKey: `${wall.levelId}|${wall.wallTypeId}|${wall.topMode}|${wall.stairFollowMode}|${wall.stairFollowProfile}|${wall.stairFollowOffsetM}|${wall.stairId ?? ""}`,
     });
 
     for (const nodeId of [wall.startNodeId, wall.endNodeId]) {
@@ -180,24 +184,19 @@ function buildRenderWallRuns(
     nodeId: string,
     blockedWallIds: ReadonlySet<string>,
   ) => {
-    const candidateWallIds = wallIdsByNodeId.get(nodeId) ?? [];
-    if (candidateWallIds.length !== 2) {
-      return null;
-    }
+    const candidates = (wallIdsByNodeId.get(nodeId) ?? [])
+      .filter((wallId) => wallId !== current.wall.id && !blockedWallIds.has(wallId))
+      .map((wallId) => wallRenderInfoById.get(wallId))
+      .filter(
+        (candidate): candidate is WallRenderInfo =>
+          candidate !== undefined &&
+          candidate.mergeKey === current.mergeKey &&
+          areDirectionsCollinear(current.direction, candidate.direction),
+      );
 
-    const candidateWallId = candidateWallIds.find(
-      (wallId) => wallId !== current.wall.id && !blockedWallIds.has(wallId),
-    );
-    if (!candidateWallId) {
-      return null;
-    }
-
-    const candidate = wallRenderInfoById.get(candidateWallId);
-    if (!candidate || candidate.mergeKey !== current.mergeKey) {
-      return null;
-    }
-
-    return areDirectionsCollinear(current.direction, candidate.direction) ? candidate : null;
+    // A straight run remains continuous through T and cross junctions. There
+    // must still be exactly one collinear continuation to avoid ambiguous forks.
+    return candidates.length === 1 ? candidates[0] : null;
   };
 
   const renderWalls: RenderWallRun[] = [];
@@ -272,6 +271,10 @@ function buildRenderWallRuns(
       levelId: initialInfo.wall.levelId,
       wallTypeId: initialInfo.wall.wallTypeId,
       topMode: initialInfo.wall.topMode,
+      stairFollowMode: initialInfo.wall.stairFollowMode,
+      stairFollowProfile: initialInfo.wall.stairFollowProfile,
+      stairFollowOffsetM: initialInfo.wall.stairFollowOffsetM,
+      stairId: initialInfo.wall.stairId,
       startNodeId,
       endNodeId: finalEndNodeId,
       start: startNode.position,

@@ -118,6 +118,7 @@ interface ViewportSceneProps {
   onMoveExternalModel: (modelId: string, position: Vec2) => void;
   measureToolUnit: MeasurementUnit;
   measureToolPermanent: boolean;
+  onEditSelection?: (selection: EditorSelection) => void;
 }
 
 interface PanDragState {
@@ -255,6 +256,7 @@ interface EntityPickerState {
   x: number;
   y: number;
   candidates: Array<EditorSelection & { label: string }>;
+  selected?: EditorSelection;
 }
 
 function getLevelStyle(project: Project, levelId: string, activeLevelId: string | null): VisibleEntityStyle | null {
@@ -331,7 +333,7 @@ function isEntityInteractiveForTool(
 ) {
   switch (activeTool) {
     case "Move":
-      return entityKind !== "wall" && entityKind !== "stair" && entityKind !== "roofFace";
+      return entityKind !== "stair" && entityKind !== "roofFace";
     case "Node":
       return entityKind === "node" || entityKind === "wall";
     case "Wall":
@@ -809,6 +811,7 @@ export function ViewportScene({
   onMoveExternalModel,
   measureToolUnit,
   measureToolPermanent,
+  onEditSelection,
 }: ViewportSceneProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const suppressClickRef = useRef(false);
@@ -2525,6 +2528,18 @@ export function ViewportScene({
       }
 
       if (dragState.kind === "select") {
+        const startScreen = worldToScreen(dragState.startWorld, metrics);
+        const endScreen = worldToScreen(dragState.currentWorld, metrics);
+        if (Math.hypot(endScreen.x - startScreen.x, endScreen.y - startScreen.y) < 4) {
+          const candidates = getEntityCandidatesAtClient(event.clientX, event.clientY);
+          if (candidates.length) {
+            const rect = rootRef.current!.getBoundingClientRect();
+            setEntityPicker({ x: Math.max(8, Math.min(event.clientX - rect.left, size.width - 260)), y: Math.max(8, Math.min(event.clientY - rect.top, size.height - 280)), candidates, selected: candidates.length === 1 ? candidates[0] : undefined });
+          } else onSelectionChange(null);
+          suppressClickRef.current = true;
+          setDragState(null);
+          return;
+        }
         const selectionBounds = getPlacementBounds(dragState.startWorld, dragState.currentWorld);
         const nextSelectionSet: EditorSelection[] = [];
 
@@ -5322,19 +5337,42 @@ export function ViewportScene({
           onPointerDown={(event) => event.stopPropagation()}
           onClick={(event) => event.stopPropagation()}
         >
-          <strong>Select object</strong>
+          <strong>{entityPicker.selected ? getSelectionLabel(entityPicker.selected) : "Select object"}</strong>
           {entityPicker.candidates.map((candidate) => (
             <button
               key={`${candidate.kind}:${candidate.id}`}
               type="button"
               onClick={() => {
                 onSelectionChange({ kind: candidate.kind, id: candidate.id });
-                setEntityPicker(null);
+                setEntityPicker({ ...entityPicker, selected: candidate });
               }}
             >
               {candidate.label}
             </button>
           ))}
+          {entityPicker.selected ? <>
+            <button type="button" onClick={() => {
+              const selected = entityPicker.selected!;
+              onSelectionChange(selected);
+              onEditSelection?.(selected);
+              setEntityPicker(null);
+            }}>Edit Properties</button>
+            <button type="button" onClick={() => {
+              onSelectionChange(entityPicker.selected!);
+              setEntityPicker(null);
+            }}>Select / Move</button>
+            <button type="button" onClick={() => {
+              const selected = entityPicker.selected!;
+              const removers: Partial<Record<EditorSelection["kind"], (id: string) => void>> = {
+                node: onDeleteNode, wall: onDeleteWall, door: onDeleteDoor, window: onDeleteWindow,
+                measure: onDeleteMeasurement, stair: onDeleteStair, shape: onDeleteShape, slab: onDeleteSlab,
+                groundSurface: onDeleteGroundSurface, room: onDeleteRoom, roofEdge: onDeleteRoofEdge,
+                roofOpening: onDeleteRoofOpening, externalModel: onDeleteExternalModel,
+              };
+              removers[selected.kind]?.(selected.id);
+              setEntityPicker(null);
+            }} disabled={entityPicker.selected.kind === "roofFace" || entityPicker.selected.kind === "roofVertex"}>Delete Object</button>
+          </> : null}
           <button type="button" onClick={() => setEntityPicker(null)}>
             Cancel
           </button>

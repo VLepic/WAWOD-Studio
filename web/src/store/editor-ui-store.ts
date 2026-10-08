@@ -18,6 +18,7 @@ export type EditorTool =
   | "RoofOpening"
   | "RoofWindow"
   | "SolarPanels"
+  | "Materials"
   | "Model"
   | "Ground"
   | "Rooms";
@@ -258,6 +259,8 @@ function isSelectionCompatibleWithTool(selection: EditorSelection | null, tool: 
       return selection.kind === "roofOpening";
     case "SolarPanels":
       return selection.kind === "solarPanelArray";
+    case "Materials":
+      return false;
     case "Model":
       return selection.kind === "externalModel";
     case "Ground":

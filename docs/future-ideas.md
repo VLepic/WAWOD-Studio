@@ -22,19 +22,26 @@ work.
 
 ### Material And Texture Layer
 
-- Add a separate material/finish layer for walls, floors, roofs, slabs, and
-  shapes.
+- [x] Add the first separate material/finish layer with named base colors and
+  assignments for walls, slabs, and solved roof faces.
+- [x] Store the material library and surface assignments in `.wawod` files and
+  consume them in the editor and detached preview renderer.
+- [x] Assign finishes independently to the left and right wall faces without
+  splitting or changing the structural wall geometry.
+- [ ] Extend assignments to additional targets such as shapes and dedicated
+  floor finishes.
+- [ ] Add optional texture assets, repeat scale, rotation, and renderer-specific
+  texture loading.
 - Keep structural types separate from visual finishes. For example, a wall type
   should describe thickness/height, while a material assignment should describe
   plaster, brick, wood, tiles, paint, or other visible surfaces.
-- Start with a small material library containing name, base color, optional
-  texture asset, repeat scale, and assignment target.
-- Use the 3D design renderer first; 2D plans can later show hatches or simple
-  material markers only where useful.
+- [ ] Let 2D plans optionally show hatches or simple material markers only where
+  useful.
 
 ### Exterior Window Blinds
 
-- Add optional exterior blinds as a 3D window design extension.
+- [x] Add optional exterior blinds and roller shutters as 3D window and door
+  design extensions.
 - Treat blinds as a design add-on attached to `WindowDesign3D`, not as a new
   structural opening.
 - Useful first parameters: enabled, color, slat angle, lowered/open amount, and
@@ -43,6 +50,14 @@ work.
   window frame.
 
 ## Interaction Polish
+
+### Unified Object Actions
+
+- [x] Add a shared 2D Move-tool menu for selecting overlapping objects, opening
+  their properties, moving them or deleting them through existing commands.
+- [ ] Extend the same action model to 3D objects and touch long-press interaction.
+- [ ] Add an explicit Extend Surface action for slabs, rooms, ground and finishes:
+  paint additional regions and union them without changing unrelated objects.
 
 ### 3D Window Opening Interaction
 

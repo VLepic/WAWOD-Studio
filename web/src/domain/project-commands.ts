@@ -5,6 +5,7 @@ import {
   createGroundSurface as buildGroundSurface,
   createLevel as buildLevel,
   createMeasurement as buildMeasurement,
+  createMaterialDefinition as buildMaterialDefinition,
   createNodeData,
   createVec2,
   createRoofOpening as buildRoofOpening,
@@ -28,6 +29,8 @@ import type {
   GroundSurface,
   Level,
   MeasurementUnit,
+  MaterialDefinition,
+  MaterialTarget,
   Project,
   ProjectSettings,
   RoofLayer,
@@ -62,6 +65,10 @@ export interface CreateWallInput {
   levelId: string;
   wallTypeId: string;
   topMode?: Wall["topMode"];
+  stairFollowMode?: Wall["stairFollowMode"];
+  stairFollowProfile?: Wall["stairFollowProfile"];
+  stairFollowOffsetM?: number;
+  stairId?: string | null;
   startNodeId: string;
   endNodeId: string;
 }
@@ -123,6 +130,8 @@ export type AddLevelInput = Omit<Level, "id"> & { id?: string };
 export type UpdateLevelInput = Partial<Omit<Level, "id">>;
 export type AddWallTypeInput = Omit<WallType, "id"> & { id?: string };
 export type UpdateWallTypeInput = Partial<Omit<WallType, "id">>;
+export type AddMaterialInput = Omit<MaterialDefinition, "id"> & { id?: string };
+export type UpdateMaterialInput = Partial<Omit<MaterialDefinition, "id">>;
 
 function normalizeProject(project: Project) {
   return cloneProject(ensureProjectDefaults(project));
@@ -899,6 +908,21 @@ export function createWall(project: Project, input: CreateWallInput) {
     throw new ProjectCommandError("Duplicate wall between the same two nodes is not allowed.");
   }
 
+  const stairFollowMode = input.stairFollowMode ?? "None";
+  const stairFollowProfile = input.stairFollowProfile ?? "Stepped";
+  const stairFollowOffsetM = input.stairFollowOffsetM ?? 0;
+  expectFinite(stairFollowOffsetM, "Wall stair offset");
+  const stairId = stairFollowMode === "None" ? null : input.stairId ?? null;
+  if (stairFollowMode !== "None") {
+    if (!stairId) {
+      throw new ProjectCommandError("Choose a stair for the wall to follow.");
+    }
+    const stair = expectStair(nextProject, stairId);
+    if (stair.levelId !== input.levelId) {
+      throw new ProjectCommandError("A wall can only follow stairs on the same level.");
+    }
+  }
+
   const segmentNodeIds = [
     input.startNodeId,
     ...getNodesOnWallSegment(nextProject, input, startNode, endNode).map((node) => node.id),
@@ -908,7 +932,11 @@ export function createWall(project: Project, input: CreateWallInput) {
   const segmentInputs = segmentNodeIds.slice(0, -1).map((startNodeId, index) => ({
     levelId: input.levelId,
     wallTypeId: input.wallTypeId,
-    topMode: input.topMode ?? "FixedHeight",
+    topMode: stairFollowMode === "None" ? input.topMode ?? "FixedHeight" : "FixedHeight",
+    stairFollowMode,
+    stairFollowProfile,
+    stairFollowOffsetM,
+    stairId,
     startNodeId,
     endNodeId: segmentNodeIds[index + 1],
   }));
@@ -932,6 +960,10 @@ export function createWall(project: Project, input: CreateWallInput) {
           levelId: segmentInput.levelId,
           wallTypeId: segmentInput.wallTypeId,
           topMode: segmentInput.topMode,
+          stairFollowMode: segmentInput.stairFollowMode,
+          stairFollowProfile: segmentInput.stairFollowProfile,
+          stairFollowOffsetM: segmentInput.stairFollowOffsetM,
+          stairId: segmentInput.stairId,
           startNodeId: segmentInput.startNodeId,
           endNodeId: segmentInput.endNodeId,
         }),
@@ -988,6 +1020,10 @@ export function insertNodeIntoWall(project: Project, wallId: string, position: V
         levelId: wall.levelId,
         wallTypeId: wall.wallTypeId,
         topMode: wall.topMode,
+        stairFollowMode: wall.stairFollowMode,
+        stairFollowProfile: wall.stairFollowProfile,
+        stairFollowOffsetM: wall.stairFollowOffsetM,
+        stairId: wall.stairId,
         startNodeId: wall.startNodeId,
         endNodeId: insertedNode.id,
       }),
@@ -995,6 +1031,10 @@ export function insertNodeIntoWall(project: Project, wallId: string, position: V
         levelId: wall.levelId,
         wallTypeId: wall.wallTypeId,
         topMode: wall.topMode,
+        stairFollowMode: wall.stairFollowMode,
+        stairFollowProfile: wall.stairFollowProfile,
+        stairFollowOffsetM: wall.stairFollowOffsetM,
+        stairId: wall.stairId,
         startNodeId: insertedNode.id,
         endNodeId: wall.endNodeId,
       }),
@@ -1040,6 +1080,11 @@ export function updateWall(project: Project, wallId: string, patch: UpdateWallIn
   const candidate: CreateWallInput = {
     levelId: patch.levelId ?? currentWall.levelId,
     wallTypeId: patch.wallTypeId ?? currentWall.wallTypeId,
+    topMode: patch.topMode ?? currentWall.topMode,
+    stairFollowMode: patch.stairFollowMode ?? currentWall.stairFollowMode,
+    stairFollowProfile: patch.stairFollowProfile ?? currentWall.stairFollowProfile,
+    stairFollowOffsetM: patch.stairFollowOffsetM ?? currentWall.stairFollowOffsetM,
+    stairId: patch.stairId !== undefined ? patch.stairId : currentWall.stairId,
     startNodeId: patch.startNodeId ?? currentWall.startNodeId,
     endNodeId: patch.endNodeId ?? currentWall.endNodeId,
   };
@@ -1061,6 +1106,23 @@ export function updateWall(project: Project, wallId: string, patch: UpdateWallIn
   if (hasDuplicateWall(nextProject, candidate, wallId)) {
     throw new ProjectCommandError("Duplicate wall between the same two nodes is not allowed.");
   }
+  const candidateStairId = candidate.stairFollowMode === "None" ? null : candidate.stairId ?? null;
+  expectFinite(candidate.stairFollowOffsetM ?? 0, "Wall stair offset");
+  if (candidate.stairFollowMode !== "None") {
+    if (!candidateStairId) {
+      throw new ProjectCommandError("Choose a stair for the wall to follow.");
+    }
+    const stair = expectStair(nextProject, candidateStairId);
+    if (stair.levelId !== candidate.levelId) {
+      throw new ProjectCommandError("A wall can only follow stairs on the same level.");
+    }
+    if (
+      nextProject.doors.some((door) => door.wallId === wallId) ||
+      nextProject.windows.some((windowOpening) => windowOpening.wallId === wallId)
+    ) {
+      throw new ProjectCommandError("Remove wall openings before linking the wall to stairs.");
+    }
+  }
 
   const updatedProject = normalizeProject({
     ...nextProject,
@@ -1069,6 +1131,12 @@ export function updateWall(project: Project, wallId: string, patch: UpdateWallIn
         ? {
             ...currentWall,
             ...patch,
+            topMode:
+              candidate.stairFollowMode === "None"
+                ? candidate.topMode ?? "FixedHeight"
+                : "FixedHeight",
+            stairFollowMode: candidate.stairFollowMode ?? "None",
+            stairId: candidateStairId,
           }
         : wall,
     ),
@@ -1081,6 +1149,10 @@ export function updateWall(project: Project, wallId: string, patch: UpdateWallIn
 
 export function createDoor(project: Project, input: CreateDoorInput) {
   const nextProject = normalizeProject(project);
+  const wall = expectWall(nextProject, input.wallId);
+  if (wall.stairFollowMode !== "None") {
+    throw new ProjectCommandError("Door openings are not supported on walls that follow stairs yet.");
+  }
   const { startNode, endNode } = getWallGeometry(nextProject, input.wallId);
 
   expectFinite(input.position.x, "Door X");
@@ -1160,6 +1232,10 @@ export function deleteDoor(project: Project, doorId: string) {
 
 export function createWindow(project: Project, input: CreateWindowInput) {
   const nextProject = normalizeProject(project);
+  const wall = expectWall(nextProject, input.wallId);
+  if (wall.stairFollowMode !== "None") {
+    throw new ProjectCommandError("Window openings are not supported on walls that follow stairs yet.");
+  }
   const { startNode, endNode } = getWallGeometry(nextProject, input.wallId);
 
   expectFinite(input.position.x, "Window X");
@@ -1300,6 +1376,11 @@ export function deleteStair(project: Project, stairId: string) {
   return normalizeProject({
     ...nextProject,
     stairs: nextProject.stairs.filter((stair) => stair.id !== stairId),
+    walls: nextProject.walls.map((wall) =>
+      wall.stairId === stairId
+        ? { ...wall, stairFollowMode: "None", stairId: null }
+        : wall,
+    ),
   });
 }
 
@@ -1968,4 +2049,85 @@ export function deleteWallType(project: Project, wallTypeId: string) {
     doors: nextProject.doors.filter((door) => !removedWallIds.has(door.wallId)),
     windows: nextProject.windows.filter((windowOpening) => !removedWallIds.has(windowOpening.wallId)),
   });
+}
+
+export function addMaterial(project: Project, input: AddMaterialInput) {
+  const nextProject = normalizeProject(project);
+  ensureNonEmptyName(input.name, "Material name");
+  if (!/^#[0-9a-fA-F]{6}$/.test(input.colorHex)) {
+    throw new ProjectCommandError("Material color must be a six-digit hex color.");
+  }
+
+  return normalizeProject({
+    ...nextProject,
+    materials: [...nextProject.materials, buildMaterialDefinition(input)],
+  });
+}
+
+export function updateMaterial(
+  project: Project,
+  materialId: string,
+  patch: UpdateMaterialInput,
+) {
+  const nextProject = normalizeProject(project);
+  const material = nextProject.materials.find((item) => item.id === materialId);
+  if (!material) {
+    throw new ProjectCommandError(`Material "${materialId}" does not exist.`);
+  }
+  if (patch.name !== undefined) {
+    ensureNonEmptyName(patch.name, "Material name");
+  }
+  if (patch.colorHex !== undefined && !/^#[0-9a-fA-F]{6}$/.test(patch.colorHex)) {
+    throw new ProjectCommandError("Material color must be a six-digit hex color.");
+  }
+
+  return normalizeProject({
+    ...nextProject,
+    materials: nextProject.materials.map((item) =>
+      item.id === materialId ? { ...item, ...patch } : item,
+    ),
+  });
+}
+
+export function deleteMaterial(project: Project, materialId: string) {
+  const nextProject = normalizeProject(project);
+  if (!nextProject.materials.some((material) => material.id === materialId)) {
+    throw new ProjectCommandError(`Material "${materialId}" does not exist.`);
+  }
+
+  return normalizeProject({
+    ...nextProject,
+    materials: nextProject.materials.filter((material) => material.id !== materialId),
+    materialAssignments: nextProject.materialAssignments.filter(
+      (assignment) => assignment.materialId !== materialId,
+    ),
+  });
+}
+
+export function assignSurfaceMaterial(
+  project: Project,
+  target: MaterialTarget,
+  materialId: string | null,
+) {
+  const nextProject = normalizeProject(project);
+  if (materialId !== null && !nextProject.materials.some((material) => material.id === materialId)) {
+    throw new ProjectCommandError(`Material "${materialId}" does not exist.`);
+  }
+
+  const materialAssignments = nextProject.materialAssignments.filter(
+    (assignment) =>
+      assignment.targetKind !== target.kind ||
+      assignment.targetId !== target.id ||
+      assignment.surface !== target.surface,
+  );
+  if (materialId !== null) {
+    materialAssignments.push({
+      materialId,
+      targetKind: target.kind,
+      targetId: target.id,
+      surface: target.surface,
+    });
+  }
+
+  return normalizeProject({ ...nextProject, materialAssignments });
 }

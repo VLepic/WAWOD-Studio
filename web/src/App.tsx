@@ -14,6 +14,7 @@ import {
   createMeasurement,
   createWindow,
   addLevel,
+  addMaterial,
   addWallType,
   createExternalModel,
   createGroundSurface,
@@ -27,6 +28,7 @@ import {
   createStair,
   createWall,
   deleteWallType,
+  deleteMaterial,
   deleteLevel,
   deleteMeasurement,
   deleteDoor,
@@ -59,6 +61,8 @@ import {
   updateWallType,
   updateShape,
   updateSlab,
+  updateMaterial,
+  assignSurfaceMaterial,
 } from "./domain/project-commands";
 import {
   type Door3DHingeSide,
@@ -87,12 +91,15 @@ import {
   type ExternalModel,
   type GroundSurface,
   type MeasurementUnit,
+  type MaterialTarget,
   type NodeData,
   type Project,
   type RoofSketch,
   type RoofOpeningCutMode,
   type RoofOpeningRotationDeg,
   type SolarPanelArray,
+  type WallStairFollowMode,
+  type WallStairFollowProfile,
   type WallTopMode,
   type RoofType,
   type Room,
@@ -104,13 +111,14 @@ import {
 } from "./domain/project-model";
 import {
   createProjectFileBlob,
+  parseProjectJson,
   stringifyProject,
   validateProject,
 } from "./domain/project-serialization";
 import {
   createPreviewWindowSnapshot,
   createPreviewWindowUrl,
-  PREVIEW_SYNC_CHANNEL,
+  previewChannelName,
   writePreviewWindowSnapshot,
   type PreviewWindowMessage,
 } from "./domain/preview-window-sync";
@@ -124,6 +132,7 @@ import {
   createViewportBoundsFromPoints,
   expandViewportBounds,
   getViewportFit,
+  getUnobstructedRectangle,
   mergeViewportBounds,
   snapValueToGrid,
   type ViewportBounds,
@@ -136,7 +145,10 @@ import {
   type WallAuthoringMode,
   useEditorUiStore,
 } from "./store/editor-ui-store";
-import { useProjectStore } from "./store/project-store";
+import { flushProjectDraft, useProjectStore } from "./store/project-store";
+import { getEditorSessionId } from "./domain/editor-session";
+import { readProjectDraft } from "./domain/project-recovery";
+import { formatDistance3D, type Measurement3D } from "./components/measure-3d";
 
 const editorTools: EditorTool[] = [
   "Move",
@@ -163,6 +175,7 @@ const editorTools3D: EditorTool[] = [
   "RoofWindow",
   "SolarPanels",
 ];
+const designEditorTools: EditorTool[] = ["Materials"];
 const editorModes: EditorMode[] = ["Building", "Design", "Terrain"];
 const BUILT_IN_SAMPLE_URL = `${import.meta.env.BASE_URL}samples/default.wawod`;
 
@@ -1134,6 +1147,25 @@ function findWallAtPoint(project: Project, levelId: string, position: Vec2, pref
   return null;
 }
 
+function getToolHint(tool: EditorTool, mode: "2d" | "3d", wallMode: WallAuthoringMode) {
+  if (mode === "3d") {
+    if (tool === "Measure") return "Drag between visible surfaces, or click two points. Escape clears the measurement.";
+    if (tool === "Materials") return "Click a wall side, slab or roof face; choose a material and apply it to that surface.";
+    return "Left-click an opening or surface to apply the tool. Right-click an existing object to edit it.";
+  }
+  if (tool === "Wall") return wallMode === "AutoWall" ? "Drag to draw a wall; existing nodes snap to the ends. Right-click a wall to delete it." : "Click the start node, then the end node. Right-click a wall to delete it.";
+  if (tool === "Move") return "Left-drag moves objects and corner handles. Right-click opens object actions; right-drag selects an area.";
+  if (tool === "Measure") return "Drag to measure. Enable Permanent to keep the dimension in the plan.";
+  if (tool === "Node") return "Click to place a node, or drag to measure and place on release. Right-click deletes or chooses an overlapping object.";
+  if (tool === "Door" || tool === "Window") return "Click a wall to create an opening. Choose Move to reposition it; right-click with its tool to delete it.";
+  if (tool === "Stair") return "Click path points from start to end; right-click to finish. Intermediate points create landings.";
+  if (tool === "Roof") return "Draw roof lines on the Roof layer. Select edges or endpoints to connect them; Move adjusts their positions.";
+  if (tool === "RoofOpening" || tool === "RoofWindow") return "Click a roof face to place an opening. Use Move to reposition it or right-click to delete it.";
+  if (tool === "Slab" || tool === "Rooms") return "Drag a rectangle, or click freeform corners and close at the first point. Connected mode merges touching regions.";
+  if (tool === "Shape" || tool === "Ground") return "Drag to draw a rectangular footprint. Right-click with this tool to delete an existing object.";
+  return "Click to place an object. Select it with Move to edit its properties.";
+}
+
 export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const viewportCanvasRef = useRef<HTMLDivElement | null>(null);
@@ -1144,9 +1176,11 @@ export default function App() {
   const previewMenuRef = useRef<HTMLDivElement | null>(null);
   const settingsMenuRef = useRef<HTMLDivElement | null>(null);
   const previewWindowSourceIdRef = useRef(createId("preview_source"));
+  const editorSessionId = getEditorSessionId();
 
   const project = useProjectStore((state) => state.project);
   const isDirty = useProjectStore((state) => state.isDirty);
+  const draftStatus = useProjectStore((state) => state.draftStatus);
   const canUndo = useProjectStore((state) => state.canUndo);
   const canRedo = useProjectStore((state) => state.canRedo);
   const isHistoryTransactionOpen = useProjectStore((state) => state.isHistoryTransactionOpen);
@@ -1213,9 +1247,15 @@ export default function App() {
   const syncWithProject = useEditorUiStore((state) => state.syncWithProject);
 
   const [activityMessage, setActivityMessage] = useState(
-    "History transactions now collapse drag edits into single undo and redo steps.",
+    useProjectStore.getState().recoveredAtIso ? "Restored your local project draft." : "Ready. Choose a tool to start drawing.",
   );
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [feedbackVisible, setFeedbackVisible] = useState(true);
+  useEffect(() => {
+    setFeedbackVisible(true);
+    const timer = window.setTimeout(() => setFeedbackVisible(false), 4000);
+    return () => window.clearTimeout(timer);
+  }, [activityMessage, activeTool]);
   const [slabConnectEnabled, setSlabConnectEnabled] = useState(false);
   const [viewportFrame, setViewportFrame] = useState({ widthPx: 0, heightPx: 0 });
   const [clipboardPayload, setClipboardPayload] = useState<SelectionClipboardPayload | null>(null);
@@ -1230,6 +1270,8 @@ export default function App() {
   const [isSettingsMenuOpen, setIsSettingsMenuOpen] = useState(false);
   const [editingLevelId, setEditingLevelId] = useState<string | null>(null);
   const [editingWallTypeId, setEditingWallTypeId] = useState<string | null>(null);
+  const [selectedMaterialTarget, setSelectedMaterialTarget] = useState<MaterialTarget | null>(null);
+  const [activeMaterialId, setActiveMaterialId] = useState<string | null>(null);
   const [floatingWindowVisibility, setFloatingWindowVisibility] = useState<
     Record<FloatingWindowId, boolean>
   >({
@@ -1282,6 +1324,8 @@ export default function App() {
     useState<ExternalRollerShutterDesign3D>(() => createDefaultExternalRollerShutterDesign3D());
   const [externalShadingFitOpeningWidth, setExternalShadingFitOpeningWidth] = useState(true);
   const [measureToolUnit, setMeasureToolUnit] = useState<MeasurementUnit>("m");
+  const [measurement3D, setMeasurement3D] = useState<Measurement3D | null>(null);
+  const [clearMeasurementToken, setClearMeasurementToken] = useState(0);
   const [measureToolPermanent, setMeasureToolPermanent] = useState(false);
   const [shapeToolKind, setShapeToolKind] = useState<Shape["kind"]>("Square");
   const [shapeToolBottomM, setShapeToolBottomM] = useState(0);
@@ -1317,6 +1361,12 @@ export default function App() {
   const [stairToolTreadDepthM, setStairToolTreadDepthM] = useState(0.28);
   const [stairToolLandingLengthM, setStairToolLandingLengthM] = useState(1.2);
   const [newWallsFollowRoof, setNewWallsFollowRoof] = useState(true);
+  const [newWallsStairFollowMode, setNewWallsStairFollowMode] =
+    useState<WallStairFollowMode>("None");
+  const [newWallsStairId, setNewWallsStairId] = useState<string | null>(null);
+  const [newWallsStairFollowProfile, setNewWallsStairFollowProfile] =
+    useState<WallStairFollowProfile>("Stepped");
+  const [newWallsStairFollowOffsetM, setNewWallsStairFollowOffsetM] = useState(0);
   const last2DToolRef = useRef<EditorTool>("Move");
   const last3DToolRef = useRef<EditorTool>("Window");
 
@@ -1324,6 +1374,10 @@ export default function App() {
   const projectValidation = validateProject(project);
   const availableEditorTools = useMemo(
     () => {
+      if (editorMode === "Design") {
+        return designEditorTools;
+      }
+
       if (editorMode !== "Building") {
         return [];
       }
@@ -1438,9 +1492,6 @@ export default function App() {
   const isGroundLevel = activeLevel ? Math.abs(activeLevel.elevationM) < 0.0001 : false;
   const canRemoveActiveLevel =
     activeLevel !== null && project.levels.length > 1 && !isGroundLevel;
-  const recentNodesOnActiveLevel = activeLevelId
-    ? project.nodes.filter((node) => node.levelId === activeLevelId)
-    : [];
   const selectedNode =
     currentSelection?.kind === "node"
       ? (project.nodes.find((node) => node.id === currentSelection.id) ?? null)
@@ -1449,6 +1500,17 @@ export default function App() {
     currentSelection?.kind === "wall"
       ? (project.walls.find((wall) => wall.id === currentSelection.id) ?? null)
       : null;
+  const selectedWallStairs = selectedWall
+    ? project.stairs.filter((stair) => stair.levelId === selectedWall.levelId)
+    : [];
+  const wallToolStairs = activeLevelId
+    ? project.stairs.filter((stair) => stair.levelId === activeLevelId)
+    : [];
+  const effectiveNewWallsStairId = wallToolStairs.some(
+    (stair) => stair.id === newWallsStairId,
+  )
+    ? newWallsStairId
+    : wallToolStairs[0]?.id ?? null;
   const selectedDoor =
     currentSelection?.kind === "door"
       ? (project.doors.find((door) => door.id === currentSelection.id) ?? null)
@@ -1535,6 +1597,18 @@ export default function App() {
     currentSelection?.kind === "externalModel"
       ? (project.externalModels.find((model) => model.id === currentSelection.id) ?? null)
       : null;
+  const activeMaterial =
+    project.materials.find((material) => material.id === activeMaterialId) ??
+    project.materials[0] ??
+    null;
+  const selectedMaterialAssignment = selectedMaterialTarget
+    ? project.materialAssignments.find(
+        (assignment) =>
+          assignment.targetKind === selectedMaterialTarget.kind &&
+          assignment.targetId === selectedMaterialTarget.id &&
+          assignment.surface === selectedMaterialTarget.surface,
+      ) ?? null
+    : null;
   const selectedDoorWall =
     selectedDoor ? project.walls.find((wall) => wall.id === selectedDoor.wallId) ?? null : null;
   const selectedDoorWallType =
@@ -1694,6 +1768,26 @@ export default function App() {
   }, [activeRoofLayerId, activeTool, availableEditorTools, editorMode, setActiveTool]);
 
   useEffect(() => {
+    if (editorMode === "Design" && !designEditorTools.includes(activeTool)) {
+      setActiveTool("Materials");
+    }
+  }, [activeTool, editorMode, setActiveTool]);
+
+  useEffect(() => {
+    if (editorMode !== "Design") {
+      setSelectedMaterialTarget(null);
+    }
+  }, [editorMode]);
+
+  useEffect(() => {
+    if (activeMaterialId && project.materials.some((material) => material.id === activeMaterialId)) {
+      return;
+    }
+
+    setActiveMaterialId(project.materials[0]?.id ?? null);
+  }, [activeMaterialId, project.materials]);
+
+  useEffect(() => {
     setIsOtherToolsMenuOpen(false);
     setOpeningToolsMenuOpen(null);
     setIsPreviewMenuOpen(false);
@@ -1718,9 +1812,6 @@ export default function App() {
     }
   }, [editingLevelId, project.levels]);
 
-  useEffect(() => {
-    console.log("[FloatingWindowPositions]", floatingWindowPositions);
-  }, [floatingWindowPositions]);
 
   useEffect(() => {
     function handlePointerDown(event: PointerEvent) {
@@ -1758,14 +1849,14 @@ export default function App() {
       hiddenLevelIds3D,
       hiddenRoofLayerIds3D,
     );
-    writePreviewWindowSnapshot(snapshot);
+    writePreviewWindowSnapshot(snapshot, editorSessionId);
 
     if (!("BroadcastChannel" in window)) {
       return;
     }
 
     const sourceId = previewWindowSourceIdRef.current;
-    const channel = new BroadcastChannel(PREVIEW_SYNC_CHANNEL);
+    const channel = new BroadcastChannel(previewChannelName(editorSessionId));
     channel.postMessage({
       type: "project-snapshot",
       sourceId,
@@ -1799,7 +1890,28 @@ export default function App() {
       channel.removeEventListener("message", handleMessage);
       channel.close();
     };
-  }, [hiddenLevelIds3D, hiddenRoofLayerIds3D, preview3D, project]);
+  }, [editorSessionId, hiddenLevelIds3D, hiddenRoofLayerIds3D, preview3D, project]);
+
+  useEffect(() => {
+    function beforeUnload(event: BeforeUnloadEvent) {
+      flushProjectDraft();
+      if (useProjectStore.getState().isDirty) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    }
+    function saveOnHide() {
+      if (document.visibilityState === "hidden") flushProjectDraft();
+    }
+    window.addEventListener("beforeunload", beforeUnload);
+    window.addEventListener("pagehide", flushProjectDraft);
+    document.addEventListener("visibilitychange", saveOnHide);
+    return () => {
+      window.removeEventListener("beforeunload", beforeUnload);
+      window.removeEventListener("pagehide", flushProjectDraft);
+      document.removeEventListener("visibilitychange", saveOnHide);
+    };
+  }, []);
 
   useEffect(() => {
     function isEditableTarget(target: EventTarget | null) {
@@ -1818,7 +1930,6 @@ export default function App() {
 
     function handleKeyDown(event: KeyboardEvent) {
       if (
-        !(event.ctrlKey || event.metaKey) ||
         isEditableTarget(event.target) ||
         isHistoryTransactionOpen
       ) {
@@ -1826,6 +1937,13 @@ export default function App() {
       }
 
       const key = event.key.toLowerCase();
+      if (key === "f" && !event.ctrlKey && !event.metaKey && !event.altKey && viewportMode === "2d") {
+        event.preventDefault();
+        if (event.shiftKey) handleFitActiveLevel();
+        else handleFitSelection();
+        return;
+      }
+      if (!(event.ctrlKey || event.metaKey)) return;
       if (key === "z" && !event.shiftKey) {
         if (!canUndo) {
           return;
@@ -1876,21 +1994,13 @@ export default function App() {
         return;
       }
 
-      if (key === "f") {
-        event.preventDefault();
-        if (event.shiftKey) {
-          handleFitActiveLevel();
-        } else {
-          handleFitSelection();
-        }
-      }
     }
 
     window.addEventListener("keydown", handleKeyDown);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [canRedo, canUndo, clipboardPayload, editorMode, isHistoryTransactionOpen, redo, selectionSet, undo]);
+  }, [canRedo, canUndo, clipboardPayload, editorMode, isHistoryTransactionOpen, redo, selectionSet, undo, viewportMode, viewportFrame, project, activeLevelId]);
 
   useEffect(() => {
     const element = viewportCanvasRef.current;
@@ -2397,11 +2507,22 @@ export default function App() {
       return;
     }
 
+    const canvasRect = viewportCanvasRef.current!.getBoundingClientRect();
+    const obstacles = Array.from(document.querySelectorAll(".floating-window, .top-toolbar-overlay, .status-line-overlay"))
+      .map((element) => element.getBoundingClientRect()).map((rect) => ({
+        left: rect.left - canvasRect.left - 8, top: rect.top - canvasRect.top - 8,
+        right: rect.right - canvasRect.left + 8, bottom: rect.bottom - canvasRect.top + 8,
+      }));
+    const usable = getUnobstructedRectangle(viewportFrame, obstacles);
     const fit = getViewportFit(
       expandViewportBounds(bounds, 0.8),
-      viewportFrame,
+      { widthPx: usable.right - usable.left, heightPx: usable.bottom - usable.top },
       project.settings.pixelsPerMeter,
+      24,
     );
+    const scale = fit.zoom * project.settings.pixelsPerMeter;
+    fit.pan.x += ((usable.left + usable.right) / 2 - viewportFrame.widthPx / 2) / scale;
+    fit.pan.y += (viewportFrame.heightPx / 2 - (usable.top + usable.bottom) / 2) / scale;
     setZoom(fit.zoom);
     setPan(fit.pan);
     reportSuccess(message);
@@ -2542,8 +2663,8 @@ export default function App() {
       hiddenLevelIds3D,
       hiddenRoofLayerIds3D,
     );
-    writePreviewWindowSnapshot(snapshot);
-    window.open(createPreviewWindowUrl(window.location.href), "_blank", "noopener,noreferrer");
+    writePreviewWindowSnapshot(snapshot, editorSessionId);
+    window.open(createPreviewWindowUrl(window.location.href, editorSessionId), "_blank", "noopener,noreferrer");
     setIsPreviewMenuOpen(false);
     reportSuccess("Opened the 3D preview in a new tab.");
   }
@@ -2589,25 +2710,6 @@ export default function App() {
     });
   }
 
-  function handleCreateNode() {
-    if (!activeLevelId) {
-      reportError("Select an active level before creating a node.");
-      return;
-    }
-
-    try {
-      applyCommand((current) =>
-        createNode(current, {
-          levelId: activeLevelId,
-          position: createVec2(recentNodesOnActiveLevel.length * 1.5, 0),
-        }),
-      );
-      reportSuccess("Created a node through the command layer.");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Node create failed.";
-      reportError(message);
-    }
-  }
 
   function handleCreateNodeAt(position: { x: number; y: number }) {
     if (!activeLevelId) {
@@ -2755,6 +2857,11 @@ export default function App() {
           levelId: activeLevelId,
           wallTypeId: activeWallTypeId,
           topMode: newWallsFollowRoof ? "FollowRoof" : "FixedHeight",
+          stairFollowMode: newWallsStairFollowMode,
+          stairFollowProfile: newWallsStairFollowProfile,
+          stairFollowOffsetM: newWallsStairFollowOffsetM,
+          stairId:
+            newWallsStairFollowMode === "None" ? null : effectiveNewWallsStairId,
           startNodeId,
           endNodeId,
         }),
@@ -2824,6 +2931,11 @@ export default function App() {
           levelId,
           wallTypeId,
           topMode: newWallsFollowRoof ? "FollowRoof" : "FixedHeight",
+          stairFollowMode: newWallsStairFollowMode,
+          stairFollowProfile: newWallsStairFollowProfile,
+          stairFollowOffsetM: newWallsStairFollowOffsetM,
+          stairId:
+            newWallsStairFollowMode === "None" ? null : effectiveNewWallsStairId,
           startNodeId: startResult.nodeId,
           endNodeId: endResult.nodeId,
         });
@@ -4127,54 +4239,7 @@ export default function App() {
     }
   }
 
-  function handleCreateWall() {
-    if (!activeLevelId || !activeWallTypeId) {
-      reportError("Select an active level and wall type before creating a wall.");
-      return;
-    }
 
-    if (recentNodesOnActiveLevel.length < 2) {
-      reportError("Create at least two nodes on the active level before linking a wall.");
-      return;
-    }
-
-    const [startNode, endNode] = recentNodesOnActiveLevel.slice(-2);
-    try {
-      applyCommand((current) =>
-        createWall(current, {
-          levelId: activeLevelId,
-          wallTypeId: activeWallTypeId,
-          topMode: newWallsFollowRoof ? "FollowRoof" : "FixedHeight",
-          startNodeId: startNode.id,
-          endNodeId: endNode.id,
-        }),
-      );
-      reportSuccess("Linked the two most recent nodes with a wall command.");
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Wall command failed.";
-      reportError(message);
-    }
-  }
-
-  function handleCreateShape() {
-    if (!activeLevelId) {
-      reportError("Select an active level before creating a shape.");
-      return;
-    }
-
-    applyCommand((current) =>
-      createShape(current, {
-        levelId: activeLevelId,
-        name: `shape_${current.shapes.length + 1}`,
-        kind: shapeToolKind,
-        pose: createPose2D(createVec2(current.shapes.length + 1, 1.25), 0),
-        sizeM: 0.8,
-        zStartM: shapeToolBottomM,
-        heightM: Math.max(0.1, shapeToolTopM - shapeToolBottomM),
-      }),
-    );
-    reportSuccess("Created a shape through the command layer.");
-  }
 
   function handleCreateShapeAt(position: Vec2 & { sizeM?: number }) {
     if (!activeLevelId) {
@@ -4198,28 +4263,6 @@ export default function App() {
     );
   }
 
-  function handleCreateSlab() {
-    if (!activeLevelId) {
-      reportError("Select an active level before creating a slab.");
-      return;
-    }
-
-    applyCommand((current) =>
-      createSlab(current, {
-        levelId: activeLevelId,
-        name: `slab_${current.slabs.length + 1}`,
-        kind: slabMode,
-        roofType: "Flat",
-        pose: createPose2D(createVec2(current.slabs.length + 1, -1.5), 0),
-        widthM: 2.4,
-        depthM: slabMode === "Circle" ? 2.4 : 1.8,
-        thicknessM: 0.2,
-        roofRiseM: 1.2,
-        zOffsetM: 0,
-      }),
-    );
-    reportSuccess("Created a slab through the command layer.");
-  }
 
   function handleCreateSlabFromPolygon(worldPolygon: Vec2[]) {
     if (!activeLevelId || worldPolygon.length < 3) {
@@ -4815,26 +4858,6 @@ export default function App() {
     );
   }
 
-  function handleCreateModel() {
-    if (!activeLevelId) {
-      reportError("Select an active level before placing an external model marker.");
-      return;
-    }
-
-    applyCommand((current) =>
-      createExternalModel(current, {
-        levelId: activeLevelId,
-        name: `model_${current.externalModels.length + 1}`,
-        uri: "model://demo_marker",
-        position: createVec2(current.externalModels.length + 1, 2.1),
-        zM: 0,
-        rollRad: 0,
-        pitchRad: 0,
-        yawRad: 0,
-      }),
-    );
-    reportSuccess("Placed an external model marker through the command layer.");
-  }
 
   function handleCreateExternalModelAt(position: Vec2) {
     if (!activeLevelId) {
@@ -4964,10 +4987,80 @@ export default function App() {
     reportSuccess("Adjusted display scale.");
   }
 
+  function handleSelectMaterialTarget(target: MaterialTarget | null) {
+    setSelectedMaterialTarget(target);
+    if (!target) {
+      return;
+    }
+
+    const assignment = project.materialAssignments.find(
+      (item) =>
+        item.targetKind === target.kind &&
+        item.targetId === target.id &&
+        item.surface === target.surface,
+    );
+    if (assignment) {
+      setActiveMaterialId(assignment.materialId);
+    }
+  }
+
+  function handleAddMaterial() {
+    const materialId = createId("material");
+    applyCommand((current) =>
+      addMaterial(current, {
+        id: materialId,
+        name: `Material ${current.materials.length + 1}`,
+        colorHex: "#d8d3c8",
+      }),
+    );
+    setActiveMaterialId(materialId);
+    reportSuccess("Added material.");
+  }
+
+  function handleUpdateActiveMaterial(patch: { name?: string; colorHex?: string }) {
+    if (!activeMaterial) {
+      return;
+    }
+
+    applyCommand((current) => updateMaterial(current, activeMaterial.id, patch));
+    reportSuccess("Updated material.");
+  }
+
+  function handleDeleteActiveMaterial() {
+    if (!activeMaterial) {
+      return;
+    }
+
+    applyCommand((current) => deleteMaterial(current, activeMaterial.id));
+    setActiveMaterialId(null);
+    reportSuccess("Deleted material and removed its surface assignments.");
+  }
+
+  function handleAssignActiveMaterial() {
+    if (!activeMaterial || !selectedMaterialTarget) {
+      return;
+    }
+
+    applyCommand((current) =>
+      assignSurfaceMaterial(current, selectedMaterialTarget, activeMaterial.id),
+    );
+    reportSuccess("Assigned material to the selected surface.");
+  }
+
+  function handleClearSurfaceMaterial() {
+    if (!selectedMaterialTarget) {
+      return;
+    }
+
+    applyCommand((current) => assignSurfaceMaterial(current, selectedMaterialTarget, null));
+    reportSuccess("Removed material from the selected surface.");
+  }
+
   const showToolWindow =
-    editorMode === "Building" &&
+    (editorMode === "Building" || (editorMode === "Design" && activeTool === "Materials")) &&
     floatingWindowVisibility.tool &&
-    (activeTool === "Measure" ||
+    (activeTool === "Wall" ||
+      activeTool === "Measure" ||
       activeTool === "Door" ||
       activeTool === "Window" ||
       activeTool === "ExternalShading" ||
@@ -4980,6 +5073,7 @@ export default function App() {
       activeTool === "RoofOpening" ||
       activeTool === "RoofWindow" ||
       activeTool === "SolarPanels" ||
+      activeTool === "Materials" ||
       viewportMode === "3d");
 
   const showContextWindow =
@@ -4995,6 +5089,104 @@ export default function App() {
     );
 
   function renderToolWindowContent() {
+    if (activeTool === "Materials") {
+      const assignedMaterial = selectedMaterialAssignment
+        ? project.materials.find(
+            (material) => material.id === selectedMaterialAssignment.materialId,
+          ) ?? null
+        : null;
+      const targetLabel = selectedMaterialTarget
+        ? `${selectedMaterialTarget.kind} / ${selectedMaterialTarget.id} / ${
+            selectedMaterialTarget.surface === "Left"
+              ? "Left side (start to end)"
+              : selectedMaterialTarget.surface === "Right"
+                ? "Right side (start to end)"
+                : "Entire surface"
+          }`
+        : "No surface selected";
+
+      return (
+        <div className="field-stack">
+          {viewportMode === "2d" ? (
+            <p className="muted">Switch to 3D to select and paint building surfaces.</p>
+          ) : (
+            <p className="muted">
+              Click a wall side, slab, or roof face to select it. Wall sides are resolved from the
+              wall start-to-end direction and do not modify structural geometry.
+            </p>
+          )}
+          <label className="field-label">
+            <span>Material</span>
+            <select
+              value={activeMaterial?.id ?? ""}
+              onChange={(event) => setActiveMaterialId(event.target.value || null)}
+              disabled={project.materials.length === 0}
+            >
+              {project.materials.length === 0 ? <option value="">No materials</option> : null}
+              {project.materials.map((material) => (
+                <option key={material.id} value={material.id}>
+                  {material.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="button-row">
+            <button type="button" onClick={handleAddMaterial}>Add Material</button>
+            <button type="button" onClick={handleDeleteActiveMaterial} disabled={!activeMaterial}>
+              Delete Material
+            </button>
+          </div>
+          {activeMaterial ? (
+            <div className="field-grid">
+              <label className="field-label field-grid-wide">
+                <span>Name</span>
+                <DraftTextInput
+                  value={activeMaterial.name}
+                  onCommit={(name) =>
+                    handleUpdateActiveMaterial({ name: name.trim() || activeMaterial.name })
+                  }
+                />
+              </label>
+              <label className="field-label field-grid-wide">
+                <span>Base Color</span>
+                <input
+                  type="color"
+                  value={activeMaterial.colorHex}
+                  onChange={(event) =>
+                    handleUpdateActiveMaterial({ colorHex: event.target.value })
+                  }
+                />
+              </label>
+            </div>
+          ) : null}
+          <div className="material-surface-summary">
+            <span>Selected Surface</span>
+            <strong>{targetLabel}</strong>
+            <small>
+              {assignedMaterial ? `Assigned: ${assignedMaterial.name}` : "Uses renderer default"}
+            </small>
+          </div>
+          <div className="button-row">
+            <button
+              type="button"
+              className="is-active"
+              onClick={handleAssignActiveMaterial}
+              disabled={!activeMaterial || !selectedMaterialTarget || viewportMode !== "3d"}
+            >
+              Apply Material
+            </button>
+            <button
+              type="button"
+              onClick={handleClearSurfaceMaterial}
+              disabled={!selectedMaterialAssignment}
+            >
+              Clear Surface
+            </button>
+          </div>
+        </div>
+      );
+    }
+
     if (viewportMode === "3d") {
       if (activeTool === "ExternalShading") {
         return (
@@ -5060,9 +5252,11 @@ export default function App() {
               </select>
             </label>
             <p className="muted">
-              3D measuring will use a different interaction flow than 2D plan dimensions.
-              For now this tool menu keeps only the measurement unit ready.
+              Drag between two visible surfaces, or click the start and end points.
+              Escape clears the measurement. Camera controls remain on the other mouse buttons.
             </p>
+            {measurement3D ? <div className="stat-row"><span>{measurement3D.complete ? "Distance" : "Measuring"}</span><strong>{formatDistance3D(measurement3D.distanceM, measureToolUnit)}</strong></div> : null}
+            <button type="button" onClick={() => setClearMeasurementToken((value) => value + 1)}>Clear Measurement</button>
           </div>
         );
       }
@@ -5908,6 +6102,99 @@ export default function App() {
       return <p className="muted">Select a 3D tool to configure it here.</p>;
     }
 
+    if (activeTool === "Wall") {
+      return (
+        <div className="field-grid">
+          <button
+            type="button"
+            className={
+              newWallsFollowRoof
+                ? "toggle-button is-active field-grid-wide"
+                : "toggle-button field-grid-wide"
+            }
+            onClick={() =>
+              setNewWallsFollowRoof((current) => {
+                const next = !current;
+                if (next) {
+                  setNewWallsStairFollowMode("None");
+                  setNewWallsStairId(null);
+                }
+                return next;
+              })
+            }
+          >
+            Follow Roof
+          </button>
+          <label className="field-label field-grid-wide">
+            <span>Follow Stair</span>
+            <select
+              value={newWallsStairFollowMode}
+              onChange={(event) => {
+                const mode = event.target.value as WallStairFollowMode;
+                setNewWallsStairFollowMode(mode);
+                if (mode === "None") {
+                  setNewWallsStairId(null);
+                } else {
+                  setNewWallsFollowRoof(false);
+                  setNewWallsStairId(effectiveNewWallsStairId);
+                }
+              }}
+            >
+              <option value="None">None</option>
+              <option value="Top" disabled={wallToolStairs.length === 0}>
+                Top Edge
+              </option>
+              <option value="Bottom" disabled={wallToolStairs.length === 0}>
+                Bottom Edge
+              </option>
+            </select>
+          </label>
+          {newWallsStairFollowMode !== "None" ? (
+            <>
+              <label className="field-label field-grid-wide">
+                <span>Linked Stair</span>
+                <select
+                  value={effectiveNewWallsStairId ?? ""}
+                  onChange={(event) => setNewWallsStairId(event.target.value)}
+                >
+                  {wallToolStairs.map((stair) => (
+                    <option key={stair.id} value={stair.id}>
+                      {stair.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field-label">
+                <span>Profile</span>
+                <select
+                  value={newWallsStairFollowProfile}
+                  onChange={(event) =>
+                    setNewWallsStairFollowProfile(
+                      event.target.value as WallStairFollowProfile,
+                    )
+                  }
+                >
+                  <option value="Stepped">Stepped</option>
+                  <option value="Smooth">Smooth</option>
+                </select>
+              </label>
+              <label className="field-label">
+                <span>Vertical Offset (m)</span>
+                <DraftNumberInput
+                  step="0.1"
+                  value={newWallsStairFollowOffsetM}
+                  onCommit={setNewWallsStairFollowOffsetM}
+                />
+              </label>
+              <p className="muted field-grid-wide">
+                Positive offset raises the followed edge; negative offset lowers it.
+              </p>
+            </>
+          ) : null}
+        </div>
+      );
+    }
+
     if (activeTool === "Door") {
       return (
         <div className="field-grid">
@@ -6550,6 +6837,106 @@ export default function App() {
     );
   }
 
+  function renderWallStairFollowControls() {
+    if (!selectedWall) {
+      return null;
+    }
+
+    return (
+      <>
+        <label className="field-label">
+          <span>Follow Stair</span>
+          <select
+            value={selectedWall.stairFollowMode}
+            onChange={(event) => {
+              const stairFollowMode = event.target.value as WallStairFollowMode;
+              const nextStairId =
+                stairFollowMode === "None"
+                  ? null
+                  : selectedWall.stairId ?? selectedWallStairs[0]?.id ?? null;
+              handleUpdateSelectedWall(
+                {
+                  stairFollowMode,
+                  stairId: nextStairId,
+                  topMode:
+                    stairFollowMode === "None" ? selectedWall.topMode : "FixedHeight",
+                },
+                stairFollowMode === "None"
+                  ? "Removed the stair link from the wall."
+                  : `Wall now follows the stair by its ${stairFollowMode.toLowerCase()} edge.`,
+              );
+            }}
+          >
+            <option value="None">None</option>
+            <option value="Top" disabled={selectedWallStairs.length === 0}>
+              Top Edge
+            </option>
+            <option value="Bottom" disabled={selectedWallStairs.length === 0}>
+              Bottom Edge
+            </option>
+          </select>
+        </label>
+        {selectedWall.stairFollowMode !== "None" ? (
+          <label className="field-label">
+            <span>Linked Stair</span>
+            <select
+              value={selectedWall.stairId ?? ""}
+              onChange={(event) =>
+                handleUpdateSelectedWall(
+                  { stairId: event.target.value },
+                  "Updated the stair linked to the wall.",
+                )
+              }
+            >
+              {selectedWallStairs.map((stair) => (
+                <option key={stair.id} value={stair.id}>
+                  {stair.name}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+        {selectedWall.stairFollowMode !== "None" ? (
+          <>
+            <label className="field-label">
+              <span>Profile</span>
+              <select
+                value={selectedWall.stairFollowProfile}
+                onChange={(event) =>
+                  handleUpdateSelectedWall(
+                    { stairFollowProfile: event.target.value as WallStairFollowProfile },
+                    "Updated the stair-following wall profile.",
+                  )
+                }
+              >
+                <option value="Stepped">Stepped</option>
+                <option value="Smooth">Smooth</option>
+              </select>
+            </label>
+            <label className="field-label">
+              <span>Vertical Offset (m)</span>
+              <DraftNumberInput
+                step="0.1"
+                value={selectedWall.stairFollowOffsetM}
+                onCommit={(value) =>
+                  handleUpdateSelectedWall(
+                    { stairFollowOffsetM: value },
+                    "Updated the stair-following wall offset.",
+                  )
+                }
+              />
+            </label>
+            <p className="muted">
+              The wall profile is projected onto the nearest flight. Positive offset raises the
+              followed edge and negative offset lowers it. Door and window openings are not
+              supported on stair-following walls yet.
+            </p>
+          </>
+        ) : null}
+      </>
+    );
+  }
+
   function renderContextWindowContent() {
     if (selectedNode) {
       return (
@@ -6614,17 +7001,21 @@ export default function App() {
             <span>Wall Top</span>
             <select
               value={selectedWall.topMode}
-              onChange={(event) =>
+              onChange={(event) => {
+                const topMode = event.target.value as WallTopMode;
                 handleUpdateSelectedWall(
-                  { topMode: event.target.value as WallTopMode },
+                  topMode === "FollowRoof"
+                    ? { topMode, stairFollowMode: "None", stairId: null }
+                    : { topMode },
                   `Updated wall top mode to ${event.target.value}.`,
-                )
-              }
+                );
+              }}
             >
               <option value="FixedHeight">Fixed Height</option>
               <option value="FollowRoof">Follow Roof</option>
             </select>
           </label>
+          {renderWallStairFollowControls()}
           <div className="button-row">
             <button type="button" onClick={() => handleDeleteWall(selectedWall.id)}>
               Delete Wall
@@ -7385,7 +7776,7 @@ export default function App() {
                 </button>
               );
             })}
-            {editorMode !== "Building" ? (
+            {availableEditorTools.length === 0 ? (
               <span className="toolbar-empty-state">Tools will be added here</span>
             ) : null}
           </div>
@@ -7618,11 +8009,22 @@ export default function App() {
                       Reset Project
                     </button>
                   </div>
+                  <button type="button" onClick={() => {
+                    const draft = readProjectDraft(true);
+                    if (!draft) { reportError("No recoverable local draft found."); return; }
+                    if (isDirty && !window.confirm("Replace this project with the last local draft?")) return;
+                    replaceProject(parseProjectJson(draft.projectJson).project, true);
+                    useProjectStore.setState({ savedProjectJson: draft.savedProjectJson, isDirty: draft.projectJson !== draft.savedProjectJson, recoveredAtIso: draft.updatedAtIso });
+                    clearSelection();
+                    reportSuccess("Restored the last local project draft.");
+                  }}>Restore Last Local Draft</button>
+                  <button type="button" onClick={() => setHelpCardOpen(true)}>Help</button>
+                  <button type="button" onClick={() => window.dispatchEvent(new Event("wawod-reset-panels"))}>Reset Panel Layout</button>
                 </div>
               ) : null}
             </div>
           <span className={isDirty ? "state-pill is-dirty" : "state-pill"}>
-            {isDirty ? "Unsaved Changes" : "Saved"}
+            {draftStatus === "pending" ? "Saving draft..." : draftStatus === "error" ? "Draft not saved" : isDirty ? "Local draft / not exported" : "Saved"}
           </span>
         </div>
       </header>
@@ -7712,6 +8114,10 @@ export default function App() {
                   onDeleteExternalModel={handleDeleteExternalModel}
                   measureToolUnit={measureToolUnit}
                   measureToolPermanent={measureToolPermanent}
+                  onEditSelection={(selection) => {
+                    setSingleSelection(selection);
+                    setFloatingWindowVisibility((current) => ({ ...current, context: true }));
+                  }}
                   onMoveInteractionStart={handleMoveInteractionStart}
                   onMoveInteractionCommit={handleMoveInteractionCommit}
                   onMoveInteractionCancel={handleMoveInteractionCancel}
@@ -7737,7 +8143,10 @@ export default function App() {
                 project={visibleProject3D}
                 preview3D={preview3D}
                 onPreview3DChange={setPreview3D}
-                activeTool={editorMode === "Building" ? activeTool : undefined}
+                measurementUnit={measureToolUnit}
+                onMeasurementChange={setMeasurement3D}
+                clearMeasurementToken={clearMeasurementToken}
+                activeTool={editorMode === "Building" || editorMode === "Design" ? activeTool : undefined}
                 selectedDoorId={editorMode === "Building" ? selectedDoor?.id ?? null : null}
                 onSelectDoor={editorMode === "Building" ? handleSelectDoor3D : undefined}
                 onInsertDoor3D={editorMode === "Building" ? handleApplyDoor3DInsert : undefined}
@@ -7763,11 +8172,13 @@ export default function App() {
                     : { kind: "RollerShutter", design: externalRollerShutterToolDesign }
                 }
                 externalShadingFitOpeningWidth={externalShadingFitOpeningWidth}
+                selectedMaterialTarget={selectedMaterialTarget}
+                onSelectMaterialTarget={editorMode === "Design" ? handleSelectMaterialTarget : undefined}
                 hiddenRoofLayerIds={hiddenRoofLayerIds3D}
               />
             )}
 
-            {editorMode !== "Building" ? (
+            {editorMode === "Terrain" || (editorMode === "Design" && viewportMode === "2d") ? (
               <div className={`editor-workspace-placeholder is-${editorMode.toLowerCase()}`}>
                 <p className="section-kicker">{editorMode} Editor</p>
                 <h2>Workspace ready for future tools</h2>
@@ -7778,10 +8189,10 @@ export default function App() {
               </div>
             ) : null}
 
-            <div className="activity-banner">
-              <strong>{activityMessage}</strong>
+            {feedbackVisible || errorMessage ? <div className="viewport-feedback" role="status">
+              <strong>{errorMessage ? activityMessage : getToolHint(activeTool, viewportMode, wallAuthoringMode)}</strong>
               {errorMessage ? <span className="error-text">{errorMessage}</span> : null}
-            </div>
+            </div> : null}
 
             {panelVisibility.helpCardOpen ? (
             <div className="viewport-card viewport-card-overlay">
@@ -7799,199 +8210,31 @@ export default function App() {
                   x
                 </button>
               </div>
-              {editorMode === "Building" ? (
-              <>
-              <p>
-                Frontend mode is now tuned around direct viewport editing, grouped history,
-                local import/export and tool-specific left-place or right-delete behavior.
-              </p>
-              <p className="muted">
-                Move Tool: left-drag moves the current entity or the whole selected set,
-                drag roof line endpoints to stretch roof lines, right-drag draws a box selection,
-                and Ctrl/Cmd+C then Ctrl/Cmd+V copies and pastes the current movable selection
-                with a small offset.
-              </p>
-              <p className="muted">
-                Node Tool: left-click places a node, or hold and drag to measure from the start point
-                and place the node on release. Right-click deletes a node, and duplicate nodes cannot
-                be placed on the same spot. If several entities overlap under a right-click, choose
-                the intended entity from the viewport menu instead.
-              </p>
-              <p className="muted">
-                Wall Tool: click one node to arm the start point, click a second
-                node to create a wall, right-click a wall to delete just that wall, and
-                right-click a node to delete all walls connected to that node.
-              </p>
-              <p className="muted">
-                Measure Tool: drag a 2D ruler to read distance in cm, dm or m. With permanent
-                storage enabled, releasing creates a plan measurement. Right-click a stored
-                measurement while Measure Tool is active to delete it.
-              </p>
-              <p className="muted">
-                Door Tool: click an existing wall to insert a door opening with the current
-                width and height defaults, then adjust the exact values in the inspector.
-                Right-click a door while Door Tool is active to delete it.
-              </p>
-              <p className="muted">
-                Window Tool: click an existing wall to insert a window opening with width,
-                height and sill defaults. Right-click a window while Window Tool is active to
-                delete it.
-              </p>
-              <p className="muted">
-                Stair Tool: left-click places stair path nodes, and right-click finishes the
-                current path into a generated stair. Intermediate path nodes create flat landings.
-              </p>
-              <p className="muted">
-                Shape Tool: click and drag to draw the shape size. Slab Tool: drag to draw
-                a rectangle slab, in circle mode click for center and drag radius, or in freeform
-                mode click straight-edged corners and close the outline at its first point. Connected
-                slab mode unions touching or overlapping flat outlines. Rooms Tool can draw rectangles,
-                close freeform outlines, or discover wall-bounded rooms automatically. Its optional
-                connected mode unions touching or overlapping rooms on the active level. Ground Tool
-                paints floor or grass rectangles, and Model Tool places a marker.
-              </p>
-              <p className="muted">
-                Shape, Slab and Model delete: right-click the entity while its matching tool
-                is active, or use the inspector delete action on the current selection.
-              </p>
-              <p className="muted">
-                The right panel controls active level, wall type, grid, display presets and
-                selection inspectors. Ground floor cannot be removed, but other levels can.
-              </p>
-              <p className="muted">
-                Inspector focus keeps the related entity selected, and X/Y edits follow grid snap
-                whenever snapping is enabled.
-              </p>
-              <p className="muted">
-                Fit actions can frame the current selection or the whole active level, and
-                preset slots save the current zoom/pan for quick recall.
-              </p>
-              <p className="muted">
-                Undo/Redo is available from the toolbar and through Ctrl/Cmd+Z and
-                Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z when focus is not inside a form field.
-              </p>
-              <p className="muted">
-                Move drags now open a temporary history transaction and commit only once
-                when the pointer is released.
-              </p>
-              <p className="muted">
-                3D View: swap the main canvas into the shared spatial editor that renders all
-                floors, walls, slabs, shapes and model markers together. Drag to orbit and use
-                the wheel to zoom; available 3D tools depend on the current editor.
-              </p>
-              <p className="muted">
-                3D Join Mode: use Architectural Join for cleaner house corners, or Node Post
-                to generate cylindrical connection posts sized from connected wall thickness and height.
-              </p>
-              <p className="muted">
-                3D Surface Mode: switch between level colors or a gray opaque textured massing view.
-              </p>
-
+              <p><strong>{activeTool} / {viewportMode === "2d" ? "2D" : "3D"}</strong></p>
+              <p>{getToolHint(activeTool, viewportMode, wallAuthoringMode)}</p>
+              <details open>
+                <summary>Navigation And Shortcuts</summary>
+                <p className="muted">2D: middle-drag pans, wheel zooms. F fits selection; Shift+F fits the active level. Move: left-drag moves an object, right-drag selects an area, right-click opens object actions.</p>
+                <p className="muted">3D: drag to orbit, wheel to zoom. Free Camera: middle-drag looks around, WASD flies, Space goes up and Shift down.</p>
+                <p className="muted">Ctrl/Cmd+Z undoes; Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z redoes. Ctrl/Cmd+C and V copy and paste 2D selections. Shortcuts do not intercept typing in fields.</p>
+              </details>
+              <details>
+                <summary>Drawing And Openings</summary>
+                <p className="muted">AutoWall: drag to draw walls and their nodes. Topology: create nodes, then click two nodes to link a wall.</p>
+                <p className="muted">2D Door and Window create structural openings. In 3D, left-click an opening to insert a design; right-click selects it for editing. Right-click outside deselects it.</p>
+                <p className="muted">Roof tools work on the Roof layer. Draw lines and connect edges or endpoints to make faces; edit heights and thickness in the context panel.</p>
+                <p className="muted">Slab and Rooms: drag rectangles or click freeform corners and close at the first point. Rooms also discover areas enclosed by walls. Stair: click path nodes, right-click to finish.</p>
+                <p className="muted">Design Editor: Materials assigns finishes to individual wall sides, slabs and roof faces in 3D. It does not change the building geometry. Terrain authoring tools are not yet available.</p>
+              </details>
+              <details>
+                <summary>Panels And Saving</summary>
+                <p className="muted">Drag a panel header to move it; use +/- to collapse or expand. Panels adapt to the viewport and scroll internally. Project settings controls their visibility.</p>
+                <p className="muted">Drafts are saved locally in this browser and recovered on reload. Export a .wawod file for a durable backup: browser storage can be cleared. Detached preview is read-only and linked to this editor tab, with its own camera and visibility.</p>
+              </details>
               <div className="quick-actions">
-                <button
-                  type="button"
-                  onClick={() => setViewportMode(viewportMode === "2d" ? "3d" : "2d")}
-                >
-                  {viewportMode === "2d" ? "Open 3D View" : "Back To 2D"}
-                </button>
-                <button type="button" onClick={resetPreview3D}>
-                  Reset 3D Camera
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleLoadBuiltInSample()}
-                >
-                  Load Built-In Sample
-                </button>
-                <button type="button" onClick={handleCreateNode}>
-                  Create Node
-                </button>
-                <button type="button" onClick={handleCreateWall}>
-                  Link Last Two Nodes
-                </button>
-                <button type="button" onClick={handleCreateShape}>
-                  Create Shape
-                </button>
-                <button type="button" onClick={handleCreateSlab}>
-                  Create Slab
-                </button>
-                <button type="button" onClick={handleCreateModel}>
-                  Place Model Marker
-                </button>
+                <button type="button" onClick={() => void handleLoadBuiltInSample()}>Load Built-In Sample</button>
+                <button type="button" onClick={() => setHelpCardOpen(false)}>Start Editing</button>
               </div>
-
-              <div className="viewport-summary-grid">
-                <div>
-                  <span className="summary-label">Selection</span>
-                  <strong>
-                    {currentSelection
-                      ? `${currentSelection.kind}:${currentSelection.id}`
-                      : "None"}
-                  </strong>
-                </div>
-                <div>
-                  <span className="summary-label">Viewport</span>
-                  <strong>
-                    Zoom {formatNumber(viewport.zoom)} | Pan {formatNumber(viewport.pan.x)}/
-                    {formatNumber(viewport.pan.y)}
-                  </strong>
-                </div>
-                <div>
-                  <span className="summary-label">Validation</span>
-                  <strong>{projectValidation.success ? "Valid Project" : "Invalid Project"}</strong>
-                </div>
-                <div>
-                  <span className="summary-label">History</span>
-                  <strong>
-                    Undo {historyLength} | Redo {futureLength}
-                  </strong>
-                  <div className="muted">
-                    {isHistoryTransactionOpen ? "Grouping active drag..." : "Ready"}
-                  </div>
-                </div>
-              </div>
-              </>
-              ) : (
-              <>
-                <p>
-                  The {editorMode} Editor workspace is now part of the shared WaWoD project.
-                </p>
-                <p className="muted">{getEditorModeDescription(editorMode)}</p>
-                <p className="muted">
-                  No authoring tools are enabled yet. The building remains visible as a read-only
-                  reference in both views, so this editor can grow without risking structural data.
-                </p>
-                <div className="quick-actions">
-                  <button
-                    type="button"
-                    onClick={() => setViewportMode(viewportMode === "2d" ? "3d" : "2d")}
-                  >
-                    {viewportMode === "2d" ? "Open 3D View" : "Back To 2D"}
-                  </button>
-                  <button type="button" onClick={resetPreview3D}>
-                    Reset 3D Camera
-                  </button>
-                </div>
-                <div className="viewport-summary-grid">
-                  <div>
-                    <span className="summary-label">Editor</span>
-                    <strong>{editorMode}</strong>
-                  </div>
-                  <div>
-                    <span className="summary-label">View</span>
-                    <strong>{viewportMode === "2d" ? "2D" : "3D"}</strong>
-                  </div>
-                  <div>
-                    <span className="summary-label">Building Reference</span>
-                    <strong>Read Only</strong>
-                  </div>
-                  <div>
-                    <span className="summary-label">Tools</span>
-                    <strong>Coming Next</strong>
-                  </div>
-                </div>
-              </>
-              )}
             </div>
             ) : null}
 
@@ -8200,13 +8443,6 @@ export default function App() {
                     Remove Wall Type
                   </button>
                 </div>
-                <button
-                  type="button"
-                  className={newWallsFollowRoof ? "toggle-button is-active" : "toggle-button"}
-                  onClick={() => setNewWallsFollowRoof((current) => !current)}
-                >
-                  Follow Roof
-                </button>
               </FloatingWindow>
             ) : null}
 
@@ -9014,17 +9250,21 @@ export default function App() {
                     <span>Wall Top</span>
                     <select
                       value={selectedWall.topMode}
-                      onChange={(event) =>
+                      onChange={(event) => {
+                        const topMode = event.target.value as WallTopMode;
                         handleUpdateSelectedWall(
-                          { topMode: event.target.value as WallTopMode },
+                          topMode === "FollowRoof"
+                            ? { topMode, stairFollowMode: "None", stairId: null }
+                            : { topMode },
                           `Updated wall top mode to ${event.target.value}.`,
-                        )
-                      }
+                        );
+                      }}
                     >
                       <option value="FixedHeight">Fixed Height</option>
                       <option value="FollowRoof">Follow Roof</option>
                     </select>
                   </label>
+                  {renderWallStairFollowControls()}
                   <div className="button-row">
                     <button type="button" onClick={() => handleDeleteWall(selectedWall.id)}>
                       Delete Wall
@@ -10343,32 +10583,18 @@ export default function App() {
         <footer className="status-line status-line-overlay">
           <span>Editor {editorMode}</span>
           <span>View {viewportMode === "2d" ? "2D" : "3D"}</span>
-          {editorMode === "Building" ? <span>Tool {activeTool}</span> : <span>Tools pending</span>}
+          {editorMode === "Terrain" ? <span>Tools pending</span> : <span>Tool {activeTool}</span>}
           {editorMode === "Building" ? <span>Level {activeLevelName}</span> : null}
-          {editorMode === "Building" ? <span>Wall Type {activeWallTypeName}</span> : null}
-          {viewportMode === "2d" ? (
-            <>
-              <span>
-                Cursor{" "}
-                {viewport.cursorWorld
-                  ? `${formatNumber(viewport.cursorWorld.x)}, ${formatNumber(viewport.cursorWorld.y)}`
-                  : "off-canvas"}
-              </span>
-              <span>
-                Zoom {formatNumber(viewport.zoom)} | Pan {formatNumber(viewport.pan.x)}/
-                {formatNumber(viewport.pan.y)}
-              </span>
-            </>
-          ) : (
-            <span>
-              Camera {(preview3D.cameraMode as string | undefined) === "FreeCamera" ? "Free" : (preview3D.cameraMode as string | undefined) === "FreeOrbit" || (preview3D.cameraMode as string | undefined) === "Free" ? "Free Orbit" : "Orbit"} | Yaw {formatNumber(preview3D.yawDeg)} | Pitch {formatNumber(preview3D.pitchDeg)} | Distance {formatNumber(preview3D.distanceMultiplier)}x | Join {preview3D.renderMode === "ArchitecturalJoin" ? "Architectural" : "Node Post"} | Surface {preview3D.surfaceMode === "LevelColor" ? "Level Color" : "Gray Opaque"}
-            </span>
-          )}
-          <span>
-            Undo {historyLength} | Redo {futureLength}
-          </span>
-          <span>{isHistoryTransactionOpen ? "History grouping active" : "History idle"}</span>
-          <span>{projectValidation.success ? "Project valid" : "Project invalid"}</span>
+          <details className="status-diagnostics">
+            <summary>Details</summary>
+            <div className="status-diagnostics-body">
+              <span>Wall Type {activeWallTypeName}</span>
+              <span>Undo {historyLength} | Redo {futureLength}</span>
+              <span>{isHistoryTransactionOpen ? "History grouping active" : "History idle"}</span>
+              <span>{projectValidation.success ? "Project valid" : "Project invalid"}</span>
+              <span>{viewportMode === "2d" ? `Zoom ${formatNumber(viewport.zoom)}` : `Camera ${preview3D.cameraMode}`}</span>
+            </div>
+          </details>
           <button
             type="button"
             className="status-line-help-button"
