@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test": "node tests/editor-reliability.mjs && node tests/roof-wall-geometry.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {

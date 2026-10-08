@@ -2,8 +2,9 @@ import { useEffect, useMemo, useState } from "react";
 import { FloatingWindow, type FloatingWindowPosition } from "./components/floating-window";
 import { ViewportScene3D } from "./components/viewport-scene-3d";
 import {
-  PREVIEW_SNAPSHOT_STORAGE_KEY,
-  PREVIEW_SYNC_CHANNEL,
+  getPreviewSessionId,
+  previewStorageKey,
+  previewChannelName,
   readPreviewWindowSnapshot,
   type PreviewWindowMessage,
 } from "./domain/preview-window-sync";
@@ -28,23 +29,25 @@ const DEFAULT_PREVIEW_3D: Preview3DState = {
   surfaceMode: "LevelColor",
 };
 
+const editorSessionId = getPreviewSessionId();
+
 function loadInitialPreviewState() {
-  const snapshot = readPreviewWindowSnapshot();
+  const snapshot = readPreviewWindowSnapshot(editorSessionId);
   return snapshot?.preview3D ?? DEFAULT_PREVIEW_3D;
 }
 
 function loadInitialHiddenLevelIds3D() {
-  const snapshot = readPreviewWindowSnapshot();
+  const snapshot = readPreviewWindowSnapshot(editorSessionId);
   return snapshot?.hiddenLevelIds3D ?? [];
 }
 
 function loadInitialHiddenRoofLayerIds3D() {
-  const snapshot = readPreviewWindowSnapshot();
+  const snapshot = readPreviewWindowSnapshot(editorSessionId);
   return snapshot?.hiddenRoofLayerIds3D ?? [];
 }
 
 function loadInitialProject() {
-  const snapshot = readPreviewWindowSnapshot();
+  const snapshot = readPreviewWindowSnapshot(editorSessionId);
   if (!snapshot) {
     return ensureProjectDefaults(createEmptyProject());
   }
@@ -121,7 +124,8 @@ export default function Preview3DWindowApp() {
   }, []);
 
   useEffect(() => {
-    const snapshot = readPreviewWindowSnapshot();
+    if (!editorSessionId) { setSyncStatus("Open this preview from the editor to connect it to a project."); return; }
+    const snapshot = readPreviewWindowSnapshot(editorSessionId);
     if (snapshot) {
       try {
         setProject(parseProjectJson(snapshot.projectJson).project);
@@ -133,12 +137,7 @@ export default function Preview3DWindowApp() {
       }
     }
 
-    if (!("BroadcastChannel" in window)) {
-      setSyncStatus("BroadcastChannel is not available in this browser.");
-      return;
-    }
-
-    const channel = new BroadcastChannel(PREVIEW_SYNC_CHANNEL);
+    const channel = "BroadcastChannel" in window ? new BroadcastChannel(previewChannelName(editorSessionId)) : null;
     const handleMessage = (event: MessageEvent<PreviewWindowMessage>) => {
       const message = event.data;
       if (!message || message.sourceId === sourceId) {
@@ -168,14 +167,14 @@ export default function Preview3DWindowApp() {
       }
     };
 
-    channel.addEventListener("message", handleMessage);
-    channel.postMessage({
+    channel?.addEventListener("message", handleMessage);
+    channel?.postMessage({
       type: "request-project-snapshot",
       sourceId,
     } satisfies PreviewWindowMessage);
 
     const handleStorage = (event: StorageEvent) => {
-      if (event.key !== PREVIEW_SNAPSHOT_STORAGE_KEY || !event.newValue) {
+      if (event.key !== previewStorageKey(editorSessionId) || !event.newValue) {
         return;
       }
 
@@ -210,8 +209,8 @@ export default function Preview3DWindowApp() {
     window.addEventListener("storage", handleStorage);
     return () => {
       window.removeEventListener("storage", handleStorage);
-      channel.removeEventListener("message", handleMessage);
-      channel.close();
+      channel?.removeEventListener("message", handleMessage);
+      channel?.close();
     };
   }, [sourceId]);
 

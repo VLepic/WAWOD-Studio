@@ -9,6 +9,7 @@ import {
   createId,
   createLevel,
   createMeasurement,
+  createMaterialDefinition,
   createNodeData,
   createPose2D,
   createRoofLayer,
@@ -35,6 +36,8 @@ import type {
   GroundSurfaceKind,
   Level,
   Measurement,
+  MaterialDefinition,
+  MaterialTargetKind,
   NodeData,
   Project,
   ProjectSettings,
@@ -53,11 +56,14 @@ import type {
   Shape,
   ShapeKind,
   Site,
+  SurfaceMaterialAssignment,
   Slab,
   SlabKind,
   Stair,
   Vec2,
   Wall,
+  WallStairFollowMode,
+  WallStairFollowProfile,
   WallTopMode,
   WallType,
   WindowOpening,
@@ -73,6 +79,8 @@ import {
   roofVertexElevationModeSchema,
   shapeKindSchema,
   slabKindSchema,
+  wallStairFollowModeSchema,
+  wallStairFollowProfileSchema,
   wallTopModeSchema,
 } from "./project-schemas";
 
@@ -331,6 +339,85 @@ function pickPose2D(source: Record<string, unknown>) {
 
   const yawDeg = pickNumber(source, "yawDeg", "yaw_deg", "rotation_deg") ?? 0;
   return createPose2D(position, yawDeg);
+}
+
+function parseMaterials(value: unknown, warnings: string[]) {
+  return asArray(value).flatMap((item, index) => {
+    const source = asObject(item);
+    if (!source) {
+      warnings.push(`materials[${index}]: skipped invalid material.`);
+      return [];
+    }
+
+    const colorHex = normalizeHexColor(source.colorHex ?? source.color_hex);
+    if (!colorHex) {
+      warnings.push(`materials[${index}]: skipped material with invalid color.`);
+      return [];
+    }
+
+    return [
+      createMaterialDefinition({
+        id: pickString(source, "id") ?? createId("material"),
+        name: pickString(source, "name") ?? `Material ${index + 1}`,
+        colorHex,
+      }),
+    ];
+  });
+}
+
+function parseMaterialAssignments(
+  value: unknown,
+  materials: MaterialDefinition[],
+  project: Project,
+  warnings: string[],
+): SurfaceMaterialAssignment[] {
+  const materialIds = new Set(materials.map((material) => material.id));
+  const targetIdsByKind: Record<MaterialTargetKind, Set<string>> = {
+    Wall: new Set(project.walls.map((wall) => wall.id)),
+    Slab: new Set(project.slabs.map((slab) => slab.id)),
+    RoofFace: new Set(project.roofSketches.flatMap((sketch) => sketch.faces.map((face) => face.id))),
+  };
+  const assignments = new Map<string, SurfaceMaterialAssignment>();
+
+  asArray(value).forEach((item, index) => {
+    const source = asObject(item);
+    const materialId = source ? pickString(source, "materialId", "material_id") : undefined;
+    const targetId = source ? pickString(source, "targetId", "target_id") : undefined;
+    const targetKindResult = z.enum(["Wall", "Slab", "RoofFace"]).safeParse(
+      source?.targetKind ?? source?.target_kind,
+    );
+    const surfaceResult = z.enum(["All", "Left", "Right"]).safeParse(source?.surface);
+    if (
+      !materialId ||
+      !targetId ||
+      !targetKindResult.success ||
+      !materialIds.has(materialId) ||
+      !targetIdsByKind[targetKindResult.data].has(targetId)
+    ) {
+      warnings.push(`materialAssignments[${index}]: skipped invalid assignment.`);
+      return;
+    }
+
+    const assignment: SurfaceMaterialAssignment = {
+      materialId,
+      targetKind: targetKindResult.data,
+      targetId,
+      surface: surfaceResult.success ? surfaceResult.data : "All",
+    };
+    const surfaces =
+      assignment.targetKind === "Wall" && assignment.surface === "All"
+        ? (["Left", "Right"] as const)
+        : [assignment.surface];
+    surfaces.forEach((surface) => {
+      const normalizedAssignment = { ...assignment, surface };
+      assignments.set(
+        `${normalizedAssignment.targetKind}:${normalizedAssignment.targetId}:${surface}`,
+        normalizedAssignment,
+      );
+    });
+  });
+
+  return [...assignments.values()];
 }
 
 function resolveReference(
@@ -1075,6 +1162,29 @@ function parseWalls(
             "topMode",
             "top_mode",
           ) ?? ("FixedHeight" satisfies WallTopMode),
+        stairFollowMode:
+          pickParsedValue(
+            source,
+            (value) => {
+              const parsed = wallStairFollowModeSchema.safeParse(value);
+              return parsed.success ? parsed.data : undefined;
+            },
+            "stairFollowMode",
+            "stair_follow_mode",
+          ) ?? ("None" satisfies WallStairFollowMode),
+        stairFollowProfile:
+          pickParsedValue(
+            source,
+            (value) => {
+              const parsed = wallStairFollowProfileSchema.safeParse(value);
+              return parsed.success ? parsed.data : undefined;
+            },
+            "stairFollowProfile",
+            "stair_follow_profile",
+          ) ?? ("Stepped" satisfies WallStairFollowProfile),
+        stairFollowOffsetM:
+          pickNumber(source, "stairFollowOffsetM", "stair_follow_offset_m") ?? 0,
+        stairId: pickString(source, "stairId", "stair_id") ?? null,
         startNodeId,
         endNodeId,
       }),
@@ -2098,6 +2208,21 @@ function repairProject(project: Project, warnings: string[]) {
     return isValid;
   });
 
+  const stairById = new Map(project.stairs.map((stair) => [stair.id, stair] as const));
+  project.walls = project.walls.map((wall) => {
+    if (wall.stairFollowMode === "None") {
+      return wall.stairId === null ? wall : { ...wall, stairId: null };
+    }
+
+    const stair = wall.stairId ? stairById.get(wall.stairId) : undefined;
+    if (!stair || stair.levelId !== wall.levelId) {
+      warnings.push(`walls: removed invalid stair link from wall "${wall.id}".`);
+      return { ...wall, stairFollowMode: "None", stairId: null };
+    }
+
+    return wall.topMode === "FixedHeight" ? wall : { ...wall, topMode: "FixedHeight" };
+  });
+
   project.shapes = project.shapes.filter((shape) => {
     const isValid = levelIds.has(shape.levelId) && shape.sizeM > 0 && shape.heightM > 0;
     if (!isValid) {
@@ -2190,10 +2315,13 @@ export function parseProjectData(data: unknown): ProjectParseResult {
   const levels = parseLevels(root.levels, warnings);
   const wallTypes = parseWallTypes(root.wallTypes ?? root.wall_types, root.settings, warnings);
   const roofLayers = parseRoofLayers(root.roofLayers ?? root.roof_layers, warnings);
+  const materials = parseMaterials(root.materials, warnings);
   const projectBase = ensureProjectDefaults({
     projectName: pickString(root, "projectName", "project_name", "name") ?? "WaWoD Studio",
     settings,
     site: parseSite(root.site, warnings),
+    materials,
+    materialAssignments: [],
     levels,
     wallTypes,
     roofLayers,
@@ -2216,6 +2344,7 @@ export function parseProjectData(data: unknown): ProjectParseResult {
   ensureUniqueIds(projectBase.levels, "level", "levels", warnings);
   ensureUniqueIds(projectBase.wallTypes, "wall_type", "wallTypes", warnings);
   ensureUniqueIds(projectBase.roofLayers, "roof_layer", "roofLayers", warnings);
+  ensureUniqueIds(projectBase.materials, "material", "materials", warnings);
 
   const levelIds = projectBase.levels.map((level) => level.id);
   const wallTypeIds = projectBase.wallTypes.map((wallType) => wallType.id);
@@ -2266,6 +2395,12 @@ export function parseProjectData(data: unknown): ProjectParseResult {
   projectBase.measurements = parseMeasurements(
     root.measurements ?? root.dimensions ?? root.dimensionLines,
     levelIds,
+    warnings,
+  );
+  projectBase.materialAssignments = parseMaterialAssignments(
+    root.materialAssignments ?? root.material_assignments,
+    projectBase.materials,
+    projectBase,
     warnings,
   );
 

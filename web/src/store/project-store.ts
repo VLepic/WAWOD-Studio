@@ -12,10 +12,13 @@ import {
   stringifyProject,
 } from "../domain/project-serialization";
 import type { ProjectParseResult } from "../domain/project-serialization";
+import { readProjectDraft, writeProjectDraft } from "../domain/project-recovery";
 
 export interface ProjectStoreState {
   project: Project;
   isDirty: boolean;
+  draftStatus: "saved" | "pending" | "error";
+  recoveredAtIso: string | null;
   canUndo: boolean;
   canRedo: boolean;
   isHistoryTransactionOpen: boolean;
@@ -42,6 +45,8 @@ export interface ProjectStoreState {
 }
 
 const initialProject = ensureProjectDefaults(createEmptyProject());
+const initialDraft = readProjectDraft();
+const restoredProject = initialDraft ? parseProjectJson(initialDraft.projectJson).project : initialProject;
 const HISTORY_LIMIT = 100;
 
 function normalizeProject(project: Project) {
@@ -60,8 +65,10 @@ function isDirtyProject(project: Project, savedProjectJson: string) {
 }
 
 export const useProjectStore = create<ProjectStoreState>((set, get) => ({
-  project: normalizeProject(initialProject),
-  isDirty: false,
+  project: normalizeProject(restoredProject),
+  isDirty: initialDraft ? isDirtyProject(restoredProject, initialDraft.savedProjectJson) : false,
+  draftStatus: "saved",
+  recoveredAtIso: initialDraft?.updatedAtIso ?? null,
   canUndo: false,
   canRedo: false,
   isHistoryTransactionOpen: false,
@@ -355,7 +362,33 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
 
   pastProjects: [],
   futureProjects: [],
-  savedProjectJson: stringifyProject(initialProject),
+  savedProjectJson: initialDraft?.savedProjectJson ?? stringifyProject(initialProject),
   currentTransactionStartProject: null,
   currentTransactionLabel: null,
 }));
+
+let draftSaveTimer: ReturnType<typeof setTimeout> | undefined;
+let draftNeeded = false;
+
+export function flushProjectDraft() {
+  if (!draftNeeded) return true;
+  clearTimeout(draftSaveTimer);
+  const state = useProjectStore.getState();
+  const saved = writeProjectDraft({
+    version: 1,
+    projectJson: stringifyProject(state.project),
+    savedProjectJson: state.savedProjectJson,
+    updatedAtIso: new Date().toISOString(),
+  });
+  useProjectStore.setState({ draftStatus: saved ? "saved" : "error" });
+  draftNeeded = !saved;
+  return saved;
+}
+
+useProjectStore.subscribe((state, previous) => {
+  if (state.project === previous.project && state.savedProjectJson === previous.savedProjectJson) return;
+  draftNeeded = true;
+  useProjectStore.setState({ draftStatus: "pending" });
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer = setTimeout(flushProjectDraft, 300);
+});

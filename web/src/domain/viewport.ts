@@ -21,6 +21,28 @@ export interface ViewportFrame {
   heightPx: number;
 }
 
+export interface ScreenRectangle { left: number; top: number; right: number; bottom: number; }
+
+export function getUnobstructedRectangle(frame: ViewportFrame, obstacles: ScreenRectangle[]): ScreenRectangle {
+  const clipped = obstacles.map((rect) => ({
+    left: Math.max(0, rect.left), top: Math.max(0, rect.top),
+    right: Math.min(frame.widthPx, rect.right), bottom: Math.min(frame.heightPx, rect.bottom),
+  })).filter((rect) => rect.right > rect.left && rect.bottom > rect.top);
+  const xs = [...new Set([0, frame.widthPx, ...clipped.flatMap((rect) => [rect.left, rect.right])])].sort((a, b) => a - b);
+  const ys = [...new Set([0, frame.heightPx, ...clipped.flatMap((rect) => [rect.top, rect.bottom])])].sort((a, b) => a - b);
+  let best = { left: 0, top: 0, right: frame.widthPx, bottom: frame.heightPx };
+  let bestArea = 0;
+  for (let x = 0; x < xs.length; x++) for (let x2 = x + 1; x2 < xs.length; x2++) {
+    for (let y = 0; y < ys.length; y++) for (let y2 = y + 1; y2 < ys.length; y2++) {
+      const rect = { left: xs[x], right: xs[x2], top: ys[y], bottom: ys[y2] };
+      const area = (rect.right - rect.left) * (rect.bottom - rect.top);
+      if (area <= bestArea || clipped.some((item) => item.left < rect.right && item.right > rect.left && item.top < rect.bottom && item.bottom > rect.top)) continue;
+      best = rect; bestArea = area;
+    }
+  }
+  return best;
+}
+
 function viewportScale(metrics: ViewportMetrics) {
   return Math.max(0.0001, metrics.pixelsPerMeter * metrics.zoom);
 }

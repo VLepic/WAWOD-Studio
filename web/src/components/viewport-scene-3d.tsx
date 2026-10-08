@@ -2,9 +2,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, events as createPointerEvents, useFrame, useThree } from "@react-three/fiber";
 import { Edges, OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
+import { Measure3D, type Measurement3D } from "./measure-3d";
 import { buildPreview3DScene } from "../domain/preview-3d-geometry";
 import { solveProjectRoofs } from "../domain/roof-solver";
 import { createRoofSurfaceFrame } from "../domain/roof-surface-geometry";
+import { getSlabWorldPolygon } from "../domain/slab-geometry";
 import {
   getSolarPanelArraySize,
   getSolarPanelModuleOffsets,
@@ -23,6 +25,8 @@ import type {
   ExternalBlindsDesign3D,
   ExternalRollerShutterDesign3D,
   Project,
+  MaterialTarget,
+  MeasurementUnit,
   RoofOpening,
   SolarPanelArray,
   WindowDesign3D,
@@ -46,6 +50,9 @@ interface ViewportScene3DProps {
   preview3D: Preview3DState;
   onPreview3DChange: (patch: Partial<Preview3DState>) => void;
   activeTool?: EditorTool;
+  measurementUnit?: MeasurementUnit;
+  onMeasurementChange?: (measurement: Measurement3D | null) => void;
+  clearMeasurementToken?: number;
   selectedDoorId?: string | null;
   onSelectDoor?: (doorId: string) => void;
   onInsertDoor3D?: (doorId: string) => void;
@@ -72,6 +79,8 @@ interface ViewportScene3DProps {
   externalShadingToolDesign?: ExternalShadingToolDesign;
   externalShadingFitOpeningWidth?: boolean;
   hiddenRoofLayerIds?: string[];
+  selectedMaterialTarget?: MaterialTarget | null;
+  onSelectMaterialTarget?: (target: MaterialTarget | null) => void;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -79,6 +88,115 @@ function clamp(value: number, min: number, max: number) {
 }
 
 type Vec3Tuple = [number, number, number];
+
+function isSameMaterialTarget(left: MaterialTarget | null, right: MaterialTarget) {
+  return left?.kind === right.kind && left.id === right.id && left.surface === right.surface;
+}
+
+function MaterialBoxInteraction({
+  target,
+  center,
+  size,
+  yawRad,
+  selected,
+  onSelect,
+  resolveTarget,
+}: {
+  target: MaterialTarget;
+  center: Vec3Tuple;
+  size: Vec3Tuple;
+  yawRad: number;
+  selected: boolean;
+  onSelect: (target: MaterialTarget) => void;
+  resolveTarget?: (event: any) => MaterialTarget;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const highlighted = hovered || selected;
+
+  return (
+    <mesh
+      position={center}
+      rotation={[0, yawRad, 0]}
+      scale={highlighted ? 1.006 : 1}
+      onPointerOver={(event) => {
+        event.stopPropagation();
+        setHovered(true);
+      }}
+      onPointerOut={(event) => {
+        event.stopPropagation();
+        setHovered(false);
+      }}
+      onClick={(event) => {
+        event.stopPropagation();
+        onSelect(resolveTarget?.(event) ?? target);
+      }}
+    >
+      <boxGeometry args={size} />
+      <meshBasicMaterial
+        color="#e8a95b"
+        transparent
+        opacity={highlighted ? 0.16 : 0}
+        colorWrite={highlighted}
+        depthWrite={false}
+        side={THREE.DoubleSide}
+      />
+      {highlighted ? <Edges color="#f0bd76" threshold={12} /> : null}
+    </mesh>
+  );
+}
+
+function MaterialPolygonInteraction({
+  target,
+  polygon,
+  selected,
+  onSelect,
+}: {
+  target: MaterialTarget;
+  polygon: Vec3Tuple[];
+  selected: boolean;
+  onSelect: (target: MaterialTarget) => void;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const geometry = useMemo(() => {
+    const contour = polygon.map((point) => new THREE.Vector2(point[0], -point[2]));
+    const triangles = THREE.ShapeUtils.triangulateShape(contour, []);
+    const meshGeometry = new THREE.BufferGeometry();
+    meshGeometry.setAttribute("position", new THREE.Float32BufferAttribute(polygon.flat(), 3));
+    meshGeometry.setIndex(triangles.flat());
+    meshGeometry.computeVertexNormals();
+    return meshGeometry;
+  }, [polygon]);
+  useEffect(() => () => geometry.dispose(), [geometry]);
+  const highlighted = hovered || selected;
+
+  return (
+    <mesh
+      geometry={geometry}
+      onPointerOver={(event) => {
+        event.stopPropagation();
+        setHovered(true);
+      }}
+      onPointerOut={(event) => {
+        event.stopPropagation();
+        setHovered(false);
+      }}
+      onClick={(event) => {
+        event.stopPropagation();
+        onSelect(target);
+      }}
+    >
+      <meshBasicMaterial
+        color="#e8a95b"
+        transparent
+        opacity={highlighted ? 0.22 : 0}
+        colorWrite={highlighted}
+        depthWrite={false}
+        side={THREE.DoubleSide}
+      />
+      {highlighted ? <Edges color="#f0bd76" threshold={10} /> : null}
+    </mesh>
+  );
+}
 
 function addVec3(left: Vec3Tuple, right: Vec3Tuple): Vec3Tuple {
   return [left[0] + right[0], left[1] + right[1], left[2] + right[2]];
@@ -281,7 +399,9 @@ function MeshPrimitive({
         opacity={primitive.opacity ?? 1}
         side={THREE.DoubleSide}
       />
-      {grayMode ? <Edges scale={1.001} color="#424750" threshold={12} /> : null}
+      {grayMode && primitive.showEdges !== false ? (
+        <Edges scale={1.001} color="#424750" threshold={12} />
+      ) : null}
     </mesh>
   );
 }
@@ -2106,6 +2226,9 @@ export function ViewportScene3D({
   preview3D,
   onPreview3DChange,
   activeTool = "Move",
+  measurementUnit = "m",
+  onMeasurementChange,
+  clearMeasurementToken = 0,
   selectedDoorId = null,
   onSelectDoor,
   onInsertDoor3D,
@@ -2128,6 +2251,8 @@ export function ViewportScene3D({
   externalShadingToolDesign,
   externalShadingFitOpeningWidth = false,
   hiddenRoofLayerIds = [],
+  selectedMaterialTarget = null,
+  onSelectMaterialTarget,
 }: ViewportScene3DProps) {
   const [isOrbiting, setIsOrbiting] = useState(false);
   const [isObjectDragging, setIsObjectDragging] = useState(false);
@@ -2171,6 +2296,54 @@ export function ViewportScene3D({
     () => buildSolarPanelArray3DDescriptors(project, hiddenRoofLayerIds),
     [hiddenRoofLayerIds, project],
   );
+  const materialWallDescriptors = useMemo(
+    () =>
+      project.walls.flatMap((wall) => {
+        const level = project.levels.find((candidate) => candidate.id === wall.levelId);
+        const wallType = project.wallTypes.find((candidate) => candidate.id === wall.wallTypeId);
+        const start = project.nodes.find((candidate) => candidate.id === wall.startNodeId);
+        const end = project.nodes.find((candidate) => candidate.id === wall.endNodeId);
+        if (!level || !wallType || !start || !end) {
+          return [];
+        }
+
+        const deltaX = end.position.x - start.position.x;
+        const deltaY = end.position.y - start.position.y;
+        const lengthM = Math.hypot(deltaX, deltaY);
+        if (lengthM < 0.0001) {
+          return [];
+        }
+
+        return [{
+          target: { kind: "Wall", id: wall.id, surface: "All" } satisfies MaterialTarget,
+          center: [
+            (start.position.x + end.position.x) / 2,
+            level.elevationM + wallType.heightM / 2,
+            -(start.position.y + end.position.y) / 2,
+          ] as Vec3Tuple,
+          size: [Math.max(wallType.thicknessM, 0.03), wallType.heightM, lengthM] as Vec3Tuple,
+          yawRad: Math.atan2(deltaX, -deltaY),
+        }];
+      }),
+    [project.levels, project.nodes, project.wallTypes, project.walls],
+  );
+  const materialSlabDescriptors = useMemo(
+    () =>
+      project.slabs.flatMap((slab) => {
+        const level = project.levels.find((candidate) => candidate.id === slab.levelId);
+        const polygon = getSlabWorldPolygon(slab);
+        if (!level || polygon.length < 3) {
+          return [];
+        }
+
+        const elevationM = level.elevationM + slab.zOffsetM + slab.thicknessM + 0.012;
+        return [{
+          target: { kind: "Slab", id: slab.id, surface: "All" } satisfies MaterialTarget,
+          polygon: polygon.map((point) => [point.x, elevationM, -point.y] as Vec3Tuple),
+        }];
+      }),
+    [project.levels, project.slabs],
+  );
   const grayMode = preview3D.surfaceMode === "GrayOpaque";
   const cameraMode = getPreview3DCameraMode(preview3D);
 
@@ -2204,6 +2377,11 @@ export function ViewportScene3D({
         gl={{ antialias: true, alpha: true }}
         camera={{ fov: 42, near: 0.1, far: 2000 }}
         events={canvasEvents}
+        onPointerMissed={() => {
+          if (activeTool === "Materials") {
+            onSelectMaterialTarget?.(null);
+          }
+        }}
       >
         <color attach="background" args={["#0a1122"]} />
         <fog attach="fog" args={["#0a1122", scene.radius * 4, scene.radius * 12]} />
@@ -2242,6 +2420,49 @@ export function ViewportScene3D({
           {scene.meshes.map((primitive, index) => (
             <MeshPrimitive key={`mesh-${index}`} primitive={primitive} grayMode={grayMode} />
           ))}
+          {activeTool === "Materials" ? (
+            <>
+              {materialWallDescriptors.map((descriptor) => (
+                <MaterialBoxInteraction
+                  key={`material-wall-${descriptor.target.id}`}
+                  {...descriptor}
+                  selected={
+                    selectedMaterialTarget?.kind === "Wall" &&
+                    selectedMaterialTarget.id === descriptor.target.id
+                  }
+                  onSelect={(target) => onSelectMaterialTarget?.(target)}
+                  resolveTarget={(event) => ({
+                    ...descriptor.target,
+                    surface: (event.face?.normal?.x ?? 0) >= 0 ? "Left" : "Right",
+                  })}
+                />
+              ))}
+              {materialSlabDescriptors.map((descriptor) => (
+                <MaterialPolygonInteraction
+                  key={`material-slab-${descriptor.target.id}`}
+                  {...descriptor}
+                  selected={isSameMaterialTarget(selectedMaterialTarget, descriptor.target)}
+                  onSelect={(target) => onSelectMaterialTarget?.(target)}
+                />
+              ))}
+              {roofSurfaces3D.map((surface) => {
+                const target = {
+                  kind: "RoofFace",
+                  id: surface.roofFaceId,
+                  surface: "All",
+                } satisfies MaterialTarget;
+                return (
+                  <MaterialPolygonInteraction
+                    key={`material-roof-${surface.roofSketchId}-${surface.roofFaceId}`}
+                    target={target}
+                    polygon={surface.polygon}
+                    selected={isSameMaterialTarget(selectedMaterialTarget, target)}
+                    onSelect={(nextTarget) => onSelectMaterialTarget?.(nextTarget)}
+                  />
+                );
+              })}
+            </>
+          ) : null}
           {solarPanelArrays3D.map((descriptor) => (
             <InteractiveSolarPanelArray
               key={descriptor.array.id}
@@ -2579,6 +2800,7 @@ export function ViewportScene3D({
           args={[Math.max(scene.radius * 4, 24), 48, "#87603a", "#31415f"]}
           position={[scene.target[0], project.site.elevationM + 0.03, scene.target[2]]}
         />
+        {activeTool === "Measure" ? <Measure3D unit={measurementUnit} radius={scene.radius} onChange={onMeasurementChange} onDraggingChange={setIsObjectDragging} clearToken={clearMeasurementToken} /> : null}
         {cameraMode === "FreeCamera" ? (
           <FreeCameraController
             preview3D={preview3D}

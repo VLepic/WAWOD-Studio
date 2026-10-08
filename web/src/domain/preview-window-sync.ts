@@ -25,14 +25,27 @@ export interface PreviewSnapshotRequestMessage {
 
 export type PreviewWindowMessage = PreviewSnapshotMessage | PreviewSnapshotRequestMessage;
 
-export function createPreviewWindowUrl(currentUrl: string) {
+export function getPreviewSessionId(hash = window.location.hash) {
+  const session = new URLSearchParams(hash.split("?")[1] ?? "").get("source");
+  return session && /^[a-zA-Z0-9_-]+$/.test(session) ? session : null;
+}
+
+export function previewStorageKey(sessionId: string) {
+  return `${PREVIEW_SNAPSHOT_STORAGE_KEY}:${sessionId}`;
+}
+
+export function previewChannelName(sessionId: string) {
+  return `${PREVIEW_SYNC_CHANNEL}:${sessionId}`;
+}
+
+export function createPreviewWindowUrl(currentUrl: string, sessionId: string) {
   const url = new URL(currentUrl);
-  url.hash = PREVIEW_WINDOW_HASH;
+  url.hash = `${PREVIEW_WINDOW_HASH}?source=${encodeURIComponent(sessionId)}`;
   return url.toString();
 }
 
 export function isPreviewWindowHash(hash: string) {
-  return hash === PREVIEW_WINDOW_HASH;
+  return hash.split("?")[0] === PREVIEW_WINDOW_HASH;
 }
 
 export function createPreviewWindowSnapshot(
@@ -50,12 +63,18 @@ export function createPreviewWindowSnapshot(
   };
 }
 
-export function writePreviewWindowSnapshot(snapshot: PreviewWindowSnapshot) {
-  window.localStorage.setItem(PREVIEW_SNAPSHOT_STORAGE_KEY, JSON.stringify(snapshot));
+export function writePreviewWindowSnapshot(snapshot: PreviewWindowSnapshot, sessionId: string) {
+  try {
+    window.localStorage.setItem(previewStorageKey(sessionId), JSON.stringify(snapshot));
+  } catch {
+    // BroadcastChannel still supports live preview when storage is unavailable.
+  }
 }
 
-export function readPreviewWindowSnapshot() {
-  const rawValue = window.localStorage.getItem(PREVIEW_SNAPSHOT_STORAGE_KEY);
+export function readPreviewWindowSnapshot(sessionId: string | null) {
+  if (!sessionId) return null;
+  let rawValue: string | null;
+  try { rawValue = window.localStorage.getItem(previewStorageKey(sessionId)); } catch { return null; }
   if (!rawValue) {
     return null;
   }
